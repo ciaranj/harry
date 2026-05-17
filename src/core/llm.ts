@@ -317,6 +317,7 @@ export async function makeCallToLLM(
 
  
         let finishReason: string | undefined;
+        let streamCompleted = false;
 
         try {
             for await (const event of parseSseStream(res.body, logger)) {
@@ -392,9 +393,10 @@ export async function makeCallToLLM(
             if (signal?.aborted) throw new Error("Aborted");
             throw e;
         }
+        streamCompleted = true;
 
-        // --- Tool execution loop ---
-        if (finishReason === 'tool_calls' && toolCallsAccum.length > 0) {
+        // --- Tool execution loop (only if stream completed normally) ---
+        if (streamCompleted && finishReason === 'tool_calls' && toolCallsAccum.length > 0) {
             currentStats.status = 'tool_running';
             setStats({ ...currentStats });
 
