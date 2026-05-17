@@ -94,6 +94,7 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                 compressed.push(msg);
             } else if (msg.role === 'assistant') {
                 const cleanMsg = createMessage({
+                    id: msg.id,  // preserve original ID for deduplication
                     role: 'assistant',
                     content: msg.content ?? '',
                 });
@@ -105,18 +106,29 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                 if (contentLength > this.config.maxToolOutputSize && !msg.content?.startsWith("[Externalized to session context → ")) {
                     const outputId = `${randomUUID()}`;
                     const outputPath = path.join(outputsDir, `${outputId}.txt`);
-                    // Dedup: if a file with this ID already exists, append a random suffix
+                    // Atomic write: try exclusive create first, fall back to suffix loop
                     let finalPath = outputPath;
-                    let suffix = 0;
-                    while (fs.existsSync(finalPath)) {
-                        suffix++;
-                        finalPath = path.join(outputsDir, `${outputId}_${suffix}.txt`);
+                    let written = false;
+                    try {
+                        fs.writeFileSync(finalPath, msg.content ?? '', { flag: 'wx', encoding: 'utf-8' });
+                        written = true;
+                    } catch (e: unknown) {
+                        if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+                            let suffix = 0;
+                            do {
+                                suffix++;
+                                finalPath = path.join(outputsDir, `${outputId}_${suffix}.txt`);
+                            } while (fs.existsSync(finalPath));
+                            fs.writeFileSync(finalPath, msg.content ?? '', 'utf-8');
+                        } else {
+                            throw e;
+                        }
                     }
-                    fs.writeFileSync(finalPath, msg.content ?? '', 'utf-8');
 
                     // Extract the UUID from the actual path for the retrieve message
                     const actualOutputId = path.basename(finalPath).replace('.txt', '');
                     compressed.push(createMessage({
+                        id: msg.id,  // preserve original ID for deduplication
                         role: 'tool',
                         content: `[Externalized to session context → use retrieve_tool_output("${actualOutputId}") to retrieve]`,
                         tool_call_id: msg.tool_call_id,
