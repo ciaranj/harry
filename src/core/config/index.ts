@@ -208,7 +208,7 @@ export function createDefaultConfigStore(opts?: {
 // ---------------------------------------------------------------------------
 
 /** Parse a .env-style file into key-value pairs. */
-function parseEnv(content: string): Record<string, string> {
+export function parseEnv(content: string): Record<string, string> {
   const result: Record<string, string> = {};
   for (const line of content.split('\n')) {
     let trimmed = line.trim();
@@ -239,8 +239,8 @@ function parseEnv(content: string): Record<string, string> {
           value = value.slice(0, closeIdx + 1);
         }
       }
-      // Remove surrounding quotes
-      if (value.length >= 2) {
+      // Remove surrounding quotes (only if we actually found a closing quote)
+      if (closeIdx !== -1 && value.length >= 2) {
         value = value.slice(1, -1);
       }
     } else {

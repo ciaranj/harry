@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import path from 'node:path';
-import { ConfigStore, GuardrailConfigManager, RawConfig, ConfigFileIO } from './index.js';
+import { ConfigStore, GuardrailConfigManager, RawConfig, ConfigFileIO, parseEnv } from './index.js';
 
 // ===================================================================
 // In-memory ConfigFileIO — zero side effects.
@@ -171,6 +171,58 @@ describe('ConfigStore', () => {
     store.load();
     const projectCfg = store.get('project') as Record<string, unknown>;
     expect(projectCfg.migrated).toBeUndefined();
+  });
+});
+
+// ===================================================================
+// parseEnv tests
+// ===================================================================
+describe('parseEnv', () => {
+  it('should parse simple KEY=VALUE pairs', () => {
+    const result = parseEnv('KEY=value');
+    expect(result).toEqual({ KEY: 'value' });
+  });
+
+  it('should strip inline comments from unquoted values', () => {
+    const result = parseEnv('KEY=value # comment');
+    expect(result).toEqual({ KEY: 'value' });
+  });
+
+  it('should preserve # inside quoted values', () => {
+    const result = parseEnv('KEY="value with # hash"');
+    expect(result).toEqual({ KEY: 'value with # hash' });
+  });
+
+  it('should strip inline comments after closing quote', () => {
+    const result = parseEnv('KEY="value"#comment');
+    expect(result).toEqual({ KEY: 'value' });
+  });
+
+  it('should NOT strip quotes from unclosed quotes (fix for issue #1)', () => {
+    const result = parseEnv('KEY="unclosed');
+    // Before fix: value would be "nclosed" (slice(1,-1) on "unclosed)
+    // After fix: value stays as "unclosed" (no stripping without closing quote)
+    expect(result).toEqual({ KEY: '"unclosed' });
+  });
+
+  it('should handle empty quoted value', () => {
+    const result = parseEnv('KEY=""');
+    expect(result).toEqual({ KEY: '' });
+  });
+
+  it('should handle quoted value with trailing whitespace', () => {
+    const result = parseEnv('KEY="value"   ');
+    expect(result).toEqual({ KEY: 'value' });
+  });
+
+  it('should skip lines without equals sign', () => {
+    const result = parseEnv('NOEQUALS');
+    expect(result).toEqual({});
+  });
+
+  it('should skip export prefix', () => {
+    const result = parseEnv('export KEY=value');
+    expect(result).toEqual({ KEY: 'value' });
   });
 });
 
