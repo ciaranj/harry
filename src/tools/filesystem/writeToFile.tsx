@@ -1,4 +1,5 @@
-import { writeFile, appendFile } from 'node:fs/promises';
+import { writeFile, appendFile, mkdir, stat } from 'node:fs/promises';
+import path from 'node:path';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
@@ -14,6 +15,18 @@ type WriteToFileResult = { success: boolean; message: string };
 function renderWriteToFileCall(path: string, content: string, mode?: string): string {
   const action = mode === 'append' ? 'Appending to' : 'Writing';
   return `${action} ${path} (${content.length} bytes)`;
+}
+
+/** Ensure the parent directory of a file path exists. */
+async function ensureParentDir(p: string): Promise<void> {
+  try {
+    const parentDir = (await stat(p)).isDirectory() ? p : (await stat(path.dirname(p))).isDirectory()
+      ? path.dirname(p)
+      : path.dirname(p);
+    // parent exists — no-op
+  } catch {
+    await mkdir(path.dirname(p), { recursive: true });
+  }
 }
 
 export const writeToFile: Tool<WriteToFileArgs, WriteToFileResult> = {

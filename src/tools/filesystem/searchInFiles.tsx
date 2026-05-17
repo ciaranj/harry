@@ -46,16 +46,15 @@ export function parseGrepOutput(stdout: string, stderrNote: string = ''): Search
   const totalMatches = rawLines.length;
 
   // Group by file (grep format: "filepath:linenum:content")
+  // Greedy (.+) backtracks to find the last ':digits:' pattern,
+  // correctly handling filenames containing colons.
   const fileGroups = new Map<string, string[]>();
   for (const line of rawLines) {
-    // grep format: filepath:linenum:content
-    // filepath may contain colons, so find the `:number:` linenum separator
-    const m = line.match(/:(\d+):/);
-    if (!m || m.index === undefined) continue;
-    const filePath = line.substring(0, m.index);
-    const rest = line.substring(m.index + m[0].length);
+    const match = line.match(/^(.+):(\d+):(.*)$/);
+    if (!match) continue;
+    const [, filePath, _linenum, lineContent] = match;
     if (!fileGroups.has(filePath)) fileGroups.set(filePath, []);
-    fileGroups.get(filePath)!.push(rest);
+    fileGroups.get(filePath)!.push(lineContent);
   }
 
   // Build capped, grouped output

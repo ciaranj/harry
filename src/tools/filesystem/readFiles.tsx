@@ -64,14 +64,17 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
       // Once limit is reached, all subsequent files are truncated (no content)
       if (limitReached) {
         // Try to get file size for unread byte report
-        const stat = await fsStat(entry.path);
+        let fileStatSize = 0;
+        try {
+          fileStatSize = (await fsStat(entry.path)).size ?? 0;
+        } catch { /* file may have been deleted */ }
         results.push({
           path: entry.path,
           success: true,
           content: undefined,
           error: undefined,
           truncated: true,
-          unreadBytes: stat?.size ?? 0,
+          unreadBytes: fileStatSize,
         });
         continue;
       }

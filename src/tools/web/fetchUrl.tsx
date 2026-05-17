@@ -184,11 +184,13 @@ async function streamToCacheFile(
   // Wait for the stream to finish, timeout, or abort
   let timedOut = false;
   let aborted = false;
+  let streamEnded = false;
   try {
     await Promise.race([
       (async () => {
         if (!res.body) {
           writeStream.end();
+          streamEnded = true;
           return;
         }
         for await (const chunk of res.body) {
@@ -196,6 +198,7 @@ async function streamToCacheFile(
           if (signal?.aborted) {
             aborted = true;
             writeStream.end();
+            streamEnded = true;
             break;
           }
           // Check size limit before writing
@@ -208,12 +211,16 @@ async function streamToCacheFile(
             }
             sizeLimitExceeded = true;
             writeStream.end();
+            streamEnded = true;
             break;
           }
           writeStream.write(chunk);
           bytesWritten += chunk.byteLength;
         }
-        writeStream.end();
+        if (!streamEnded) {
+          writeStream.end();
+          streamEnded = true;
+        }
       })(),
       timeoutPromise,
       abortPromise,
@@ -227,12 +234,21 @@ async function streamToCacheFile(
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 
-  // Wait for the write stream to finish flushing
-  await new Promise<void>((resolve, reject) => {
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
-    writeStream.end();
-  });
+  // Wait for the write stream to finish flushing — only if not already ended
+  if (!streamEnded) {
+    await new Promise<void>((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+      writeStream.end();
+    });
+  } else {
+    // Stream already ended — wait for it to fully flush
+    await new Promise<void>((resolve, reject) => {
+      writeStream.on('finish', resolve);
+      writeStream.on('error', reject);
+      // Don't call end() again — it was already called above
+    });
+  }
 
   const actualBytes = fs.existsSync(filePath) ? (await fsPromises.stat(filePath)).size : 0;
 

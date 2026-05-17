@@ -30,7 +30,7 @@ interface McpTransport {
 let mcpClient: McpClient | null = null;
 let mcpTransport: McpTransport | null = null;
 
-export async function connectToServer(url: string): Promise<boolean> {
+export async function connectToServer(url: string, logger?: Logger): Promise<boolean> {
     try {
         // Clean up old connection before creating a new one
         if (mcpTransport) {
@@ -48,7 +48,10 @@ export async function connectToServer(url: string): Promise<boolean> {
         mcpTransport = new StreamableHTTPClientTransport(new URL(url)) as unknown as McpTransport;
         await mcpClient.connect(mcpTransport);
         return true;
-    } catch (e) { return false; }
+    } catch (e) {
+        logger?.error({ url, error: String(e) }, 'MCP connection failed');
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,8 @@ interface SseEvent {
  * Handles partial lines across chunks via a buffer, and accumulates
  * incomplete JSON fragments that span multiple network chunks.
  */
+const MAX_PARTIAL_JSON_BYTES = 1024 * 1024; // 1 MB hard cap on accumulated partial JSON
+
 async function* parseSseStream(
     body: ReadableStream,
     logger: Logger
@@ -98,6 +103,15 @@ async function* parseSseStream(
 
             if (data.startsWith('{') || data.startsWith('[')) {
                 partialJson += data;
+                // Hard cap to prevent memory exhaustion on very long cross-chunk fragments
+                if (Buffer.byteLength(partialJson) > MAX_PARTIAL_JSON_BYTES) {
+                    logger.warn(
+                        { partialLength: Buffer.byteLength(partialJson) },
+                        'SSE partial JSON exceeded hard cap, resetting'
+                    );
+                    partialJson = "";
+                    continue;
+                }
                 try {
                     yield JSON.parse(partialJson) as SseEvent;
                     partialJson = "";
@@ -177,6 +191,7 @@ export async function dispatchTool(
 // ---------------------------------------------------------------------------
 
 interface ToolCallAccumulator {
+    index?: number;
     id?: string;
     type?: string;
     function: { name?: string; arguments: string };
@@ -204,7 +219,14 @@ function appendReasoning(lastMsg: Message, reasoning: string): Message {
 }
 
 function setToolCalls(lastMsg: Message, toolCalls: ToolCallAccumulator[]): Message {
-    return { ...lastMsg, tool_calls: toolCalls as Message['tool_calls'] };
+    // Validate that each tool call has a name before type assertion.
+    // Missing name would produce invalid tool calls in the LLM payload.
+    return { ...lastMsg, tool_calls: toolCalls.map(tc => ({
+        index: tc.index,
+        id: tc.id,
+        type: tc.type,
+        function: { name: tc.function.name ?? '', arguments: tc.function.arguments ?? '' }
+    })) as Message['tool_calls'] };
 }
 
 function logStats(logger: pino.Logger, startTime: bigint, label: string, stats: Stats): void {

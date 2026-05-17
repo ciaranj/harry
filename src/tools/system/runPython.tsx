@@ -31,12 +31,7 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
       const maxOutput = 1024 * 1024; // 1MB cap to prevent OOM
       let timedOut = false;
       const timeoutMs = 60_000;
-      let timer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-        timedOut = true;
-        proc.kill();
-      }, timeoutMs);
-
-      proc.on('close', () => { if (timer) clearTimeout(timer); });
+      let timer: ReturnType<typeof setTimeout> | null = null;
 
       proc.stdout.on('data', (d) => {
         stdout += d.toString();
@@ -47,16 +42,33 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
       });
       proc.stderr.on('data', (d) => { stderr += d; });
 
-      proc.on('close', (code) => {
+      const cleanupTimer = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+
+      proc.on('close', (exitCode) => {
+        cleanupTimer();
         if (timedOut) {
           resolve({ success: false, output: 'Python execution timed out (60s)' });
-        } else if (code !== 0 && stderr) {
+        } else if (exitCode !== 0 && stderr) {
           resolve({ success: false, output: stderr.trim() });
         } else {
           resolve({ success: true, output: stdout.trim() || '(no output)' });
         }
       });
-      proc.on('error', (e) => resolve({ success: false, output: `Failed to launch ipython: ${e.message}` }));
+
+      proc.on('error', (e) => {
+        cleanupTimer();
+        resolve({ success: false, output: `Failed to launch ipython: ${e.message}` });
+      });
+
+      timer = setTimeout(() => {
+        timedOut = true;
+        proc.kill();
+      }, timeoutMs);
     });
   },
   renderCall: ({ code }: RunPythonArgs) => (

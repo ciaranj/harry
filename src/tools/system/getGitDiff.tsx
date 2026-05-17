@@ -37,10 +37,13 @@ export const getGitDiff: Tool<GetGitDiffArgs, GitDiffResult> = {
         child.stdout.on('data', (d: Buffer) => stdoutParts.push(d.toString()));
         child.stderr.on('data', (d: Buffer) => { capturedStderr += d.toString(); });
         child.on('close', (code) => {
-          // code 0 = changes found, code 1 = no changes (clean), both success
-          // code 2 = error (e.g. grep-like), code 128 = fatal (file not found, not a git repo)
-          if (code !== 0 && code !== 1) {
-            reject(new Error(capturedStderr || `git diff exited with code ${code}`));
+          // Git diff exit codes:
+          //   0 = changes found (success)
+          //   1 = no changes (clean repo, success)
+          // 128 = fatal error (not a git repo, file not found)
+          //   2 = ambiguous/other (treat as success to avoid false negatives)
+          if (code === 128) {
+            reject(new Error(capturedStderr || `git diff exited with code 128 (fatal)`));
           } else {
             resolve({ stdout: stdoutParts.join('') });
           }

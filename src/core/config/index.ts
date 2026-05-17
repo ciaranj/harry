@@ -227,6 +227,8 @@ function parseEnv(content: string): Record<string, string> {
     let value = trimmed.slice(eqIdx + 1).trim();
 
     // Strip inline comments (# and everything after, outside quotes)
+    // Only strip if the value doesn't start with a quote, so that
+    // `password="sec#ret"` preserves the `#` inside quotes.
     if (!value.startsWith('"') && !value.startsWith("'")) {
       const commentIdx = value.indexOf('#');
       if (commentIdx !== -1) {
@@ -234,9 +236,10 @@ function parseEnv(content: string): Record<string, string> {
       }
     }
 
-    // Remove surrounding quotes
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))) {
+    // Remove surrounding quotes (support both single and double quotes)
+    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+      value = value.slice(1, -1);
+    } else if (value.startsWith("'") && value.endsWith("'") && value.length >= 2) {
       value = value.slice(1, -1);
     }
 
