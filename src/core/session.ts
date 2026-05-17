@@ -12,7 +12,8 @@ function generateSessionId(): string {
     const h = String(now.getHours()).padStart(2, '0');
     const mi = String(now.getMinutes()).padStart(2, '0');
     const s = String(now.getSeconds()).padStart(2, '0');
-    return `${y}-${mo}-${d}T${h}${mi}${s}-${process.pid}`;
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    return `${y}-${mo}-${d}T${h}${mi}${s}${ms}-${process.pid}`;
 }
 
 export type SessionStats = {
