@@ -12,6 +12,6 @@ export const fsCompat = {
     fs.writeFileSync(p, data, encoding as BufferEncoding);
   },
   mkdirSync(p: string, opts?: { recursive: boolean }): void {
-    fs.mkdirSync(p, { recursive: true, ...opts });
+    fs.mkdirSync(p, opts ?? { recursive: true });
   },
 } as const;
