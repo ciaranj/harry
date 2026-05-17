@@ -39,6 +39,7 @@ export const searchWeb: Tool<SearchWebArgs, SearchWebResult> = {
       url.searchParams.append('format', 'json');
       const res = await fetch(url.toString());
       const data = await res.json();
+      if (data.error) return { success: false, results: [] };
       if (!data.results?.length) return { success: true, results: [] };
       const formattedResults: SearchResult[] = data.results.slice(0, 5).map((r: any) => ({
         title: r.title,

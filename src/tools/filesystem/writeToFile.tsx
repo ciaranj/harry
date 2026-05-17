@@ -1,4 +1,4 @@
-import { writeFile, appendFile, mkdir, stat } from 'node:fs/promises';
+import { writeFile, appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import React from 'react';
 import { Text } from 'ink';
@@ -18,15 +18,9 @@ function renderWriteToFileCall(path: string, content: string, mode?: string): st
 }
 
 /** Ensure the parent directory of a file path exists. */
-async function ensureParentDir(p: string): Promise<void> {
-  try {
-    const parentDir = (await stat(p)).isDirectory() ? p : (await stat(path.dirname(p))).isDirectory()
-      ? path.dirname(p)
-      : path.dirname(p);
-    // parent exists — no-op
-  } catch {
-    await mkdir(path.dirname(p), { recursive: true });
-  }
+async function ensureParentDir(_p: string): Promise<void> {
+  // mkdir -p is idempotent; no need for the TOCTOU stat check
+  await mkdir(path.dirname(_p), { recursive: true });
 }
 
 export const writeToFile: Tool<WriteToFileArgs, WriteToFileResult> = {
