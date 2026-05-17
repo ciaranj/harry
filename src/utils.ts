@@ -16,14 +16,11 @@ export interface LLMPayload {
  * Builds the payload to be sent to the LLM.
  */
 export function buildLLMPayload(messages: Message[], tools: any[]): LLMPayload {
-    // No-Op filter currently
-    const filteredMessages = messages.filter((message) => true);
-
     return {
         model: config.getString('MODEL'),
         messages: [
             { role: 'system', content: systemPrompt },
-            ...filteredMessages
+            ...messages
         ],
         tools,
         stream: true,

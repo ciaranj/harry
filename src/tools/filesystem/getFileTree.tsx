@@ -44,7 +44,7 @@ export const getFileTree: Tool<GetFileTreeArgs, FileTreeResult> = {
       };
 
       const build = async (p: string, currentDepth: number, ignorePatterns: string[], indent = ""): Promise<string> => {
-        if (currentDepth > max_depth) return "";
+        if (currentDepth >= max_depth) return "";
         let entries;
         try { entries = await readdir(p, { withFileTypes: true }); }
         catch (e: any) { return `${indent}[DIR] ${path.basename(p)} (Permission Denied)\n`; }

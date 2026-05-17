@@ -66,11 +66,10 @@ export class ConfigStore {
 
     // Build per-scope in-memory state from the initial config.
     const base = opts.initial ?? {};
-    if (!base.updatedAt) base.updatedAt = new Date().toISOString();
     if (!base.version) base.version = this.targetVersion;
     this.scopes = new Map([
-      ['global', { ...base }],
-      ['project', { ...base }],
+      ['global', { ...base, updatedAt: base.updatedAt ?? new Date().toISOString() }],
+      ['project', { ...base, updatedAt: base.updatedAt ?? new Date().toISOString() }],
     ]);
   }
 
