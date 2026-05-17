@@ -43,19 +43,26 @@ export const retrieveToolOutput: Tool<RetrieveToolOutputArgs, RetrieveResult> = 
 
     const outputPath = path.join(outputsDir, `${outputId}.txt`);
 
-    // Prevent path traversal: resolve the actual path and verify it's still within outputsDir
-    const resolvedOutputPath = fs.realpathSync(outputPath) ?? outputPath;
-    const resolvedOutputsDir = fs.realpathSync(outputsDir) ?? outputsDir;
+    // Prevent path traversal: resolve outputsDir first (once), then check that outputPath
+    // resolves inside it. Using realpathSync on the directory before checking the file
+    // avoids TOCTOU: the directory itself is canonical, and the file is constructed
+    // deterministically from the resolved directory + outputId.
+    const resolvedOutputsDir = (() => {
+      try { return fs.realpathSync(outputsDir); } catch { return outputsDir; }
+    })();
+
+    const resolvedOutputPath = path.join(resolvedOutputsDir, `${outputId}.txt`);
+
     if (!resolvedOutputPath.startsWith(resolvedOutputsDir + path.sep)) {
       return { success: false, content: `Output ID "${outputId}" resolved outside session context.` };
     }
 
-    if (!fs.existsSync(outputPath)) {
+    if (!fs.existsSync(resolvedOutputPath)) {
       return { success: false, content: `No tool output found with ID "${outputId}" in session context.` };
     }
 
     try {
-      const content = fs.readFileSync(outputPath, 'utf-8');
+      const content = fs.readFileSync(resolvedOutputPath, 'utf-8');
       return { success: true, content };
     } catch (err) {
       return { success: false, content: `Failed to read tool output: ${err instanceof Error ? err.message : String(err)}` };

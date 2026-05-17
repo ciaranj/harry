@@ -29,22 +29,37 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
       const proc = spawn('ipython', ['--no-banner', '--no-confirm-exit', '-c', code]);
       let stdout = '', stderr = '';
       const maxOutput = 1024 * 1024; // 1MB cap to prevent OOM
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
       let timedOut = false;
       const timeoutMs = 60_000;
       let timer: ReturnType<typeof setTimeout> | null = null;
 
       proc.stdout.on('data', (d) => {
-        stdout += d.toString();
-        if (Buffer.byteLength(stdout) > maxOutput) {
-          stdout = stdout.slice(0, maxOutput) + '\n[OUTPUT TRUNCATED]';
+        if (stdoutTruncated) return;
+        const chunk = d.toString();
+        // Check BEFORE appending — prevents single oversized chunk from overflowing.
+        if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > maxOutput) {
+          const remaining = maxOutput - Buffer.byteLength(stdout);
+          if (remaining > 0) stdout += chunk.slice(0, remaining);
+          stdout += '\n[OUTPUT TRUNCATED]';
+          stdoutTruncated = true;
           proc.kill();
+        } else {
+          stdout += chunk;
         }
       });
       proc.stderr.on('data', (d) => {
-        stderr += d.toString();
-        if (Buffer.byteLength(stderr) > maxOutput) {
-          stderr = stderr.slice(0, maxOutput) + '\n[STDERR TRUNCATED]';
+        if (stderrTruncated) return;
+        const chunk = d.toString();
+        if (Buffer.byteLength(stderr) + Buffer.byteLength(chunk) > maxOutput) {
+          const remaining = maxOutput - Buffer.byteLength(stderr);
+          if (remaining > 0) stderr += chunk.slice(0, remaining);
+          stderr += '\n[STDERR TRUNCATED]';
+          stderrTruncated = true;
           proc.kill();
+        } else {
+          stderr += chunk;
         }
       });
 

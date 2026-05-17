@@ -15,7 +15,7 @@ const appConfig = AppConfig.getInstance();
 
 function useStdoutDimensions(): [number, number] {
     const { stdout } = useStdout();
-    const [dimensions, setDimensions] = useState<[number, number]>([stdout.columns, stdout.rows]);
+    const [dimensions, setDimensions] = useState<[number, number]>([stdout.columns ?? 80, stdout.rows ?? 24]);
     useEffect(() => {
         const handler = () => setDimensions([stdout.columns, stdout.rows]);
         stdout.on('resize', handler);
@@ -260,6 +260,7 @@ const reservedHeight = useMemo(() => {
         }
 
         if (value === '/compact') {
+            // This command forces a compact, regardless of whether 'shouldTrigger' would've fired
             const preCompactMessageLength = store.getMessages().length;
             const result = await compactionStrategy.doCompaction(store);
             const postCompactMessageLength = store.getMessages().length;

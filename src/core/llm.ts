@@ -82,6 +82,7 @@ interface SseEvent {
  * incomplete JSON fragments that span multiple network chunks.
  */
 const MAX_PARTIAL_JSON_BYTES = 1024 * 1024; // 1 MB hard cap on accumulated partial JSON
+const PARTIAL_JSON_TIMEOUT_MS = 30_000; // 30 seconds — reset if accumulating too long
 
 async function* parseSseStream(
     body: ReadableStream,
@@ -91,8 +92,17 @@ async function* parseSseStream(
     let buffer = "";
     let partialJson = "";
 
+    let partialJsonStart = Date.now();
     for await (const chunk of body) {
+        const now = Date.now();
+        if (partialJson && (now - partialJsonStart) > PARTIAL_JSON_TIMEOUT_MS) {
+            // Don't discard accumulated data — try to emit it as-is.
+            // Large streaming responses (e.g. long tool outputs) can legitimately
+            // take >30s to stream; discarding would corrupt the response.
+            partialJsonStart = now;
+        }
         buffer += decoder.write(chunk);
+        partialJsonStart = now;
         const lines = buffer.split('\n');
         buffer = lines.pop() || "";
 
@@ -127,7 +137,10 @@ async function* parseSseStream(
                         'SSE partial JSON (cross-chunk fragment)'
                     );
                 }
-            } else {
+            } else if (partialJson) {
+                // Only accumulate non-JSON lines if we're already in the middle of a
+                // partial JSON fragment. Standalone SSE fields like "retry:5000" would
+                // corrupt the buffer if accumulated blindly.
                 partialJson += data;
             }
         }
@@ -148,22 +161,54 @@ interface LlmRequestOptions {
 async function fetchWithTimeout(opts: LlmRequestOptions): Promise<Response> {
     const { fetchUrl, body, signal, timeoutMs } = opts;
 
+    // Fail fast if already aborted
+    if (signal?.aborted) {
+        throw new Error("LLM request aborted");
+    }
+
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let aborted = false;
+    let fetchController: AbortController | null = null;
+
+    // Timeout that respects the abort signal
     const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(() => reject(new Error(`LLM request timeout after ${timeoutMs}ms`)), timeoutMs);
+        timeoutHandle = setTimeout(() => {
+            if (!aborted) {
+                reject(new Error(`LLM request timeout after ${timeoutMs}ms`));
+            }
+        }, timeoutMs);
+        // If already aborted during setup, clean up and reject
+        if (signal?.aborted) {
+            clearTimeout(timeoutHandle!);
+        }
+        signal?.addEventListener('abort', () => {
+            aborted = true;
+            clearTimeout(timeoutHandle!);
+        });
     });
+
+    // If an external abort signal is provided, create our own controller
+    // so we can cancel the fetch independently when timeout wins the race.
+    if (signal) {
+        fetchController = new AbortController();
+        signal.addEventListener('abort', () => {
+            fetchController?.abort();
+        });
+    }
 
     const fetchPromise = fetch(fetchUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
-        signal
+        signal: fetchController?.signal
     });
 
     const res = await Promise.race([fetchPromise, timeoutPromise]) as Response;
 
-    // Clean up timeout — race resolved, no longer needed
+    // Clean up timeout and listener — race resolved, no longer needed
+    aborted = true;
     if (timeoutHandle) clearTimeout(timeoutHandle);
+    fetchController?.abort(); // Cancel any lingering fetch
 
     return res;
 }
@@ -186,7 +231,7 @@ export async function dispatchTool(
         const result = await mcpClient.callTool({ name, arguments: args as Record<string, unknown> });
         return JSON.stringify(result.content);
     }
-    return "Error: Tool not found and MCP client not connected";
+    throw new Error(`Tool not found: ${name} (MCP client not connected)`);
 }
 
 // ---------------------------------------------------------------------------

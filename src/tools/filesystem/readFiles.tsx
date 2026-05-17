@@ -85,6 +85,10 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
           let content = cache.get(entry.path);
           if (content === undefined) {
             content = await readFile(entry.path, 'utf-8');
+            // Strip UTF-8 BOM (U+FEFF) if present
+            if (content.startsWith('\uFEFF')) {
+              content = content.slice(1);
+            }
             cache.set(entry.path, content);
           }
           const byteLen = Buffer.byteLength(content, 'utf-8');
@@ -125,6 +129,10 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
           let content = cache.get(p);
           if (content === undefined) {
             content = await readFile(p, 'utf-8');
+            // Strip UTF-8 BOM (U+FEFF) if present
+            if (content.startsWith('\uFEFF')) {
+              content = content.slice(1);
+            }
             cache.set(p, content);
           }
           const allLines = content.split('\n');

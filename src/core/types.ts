@@ -1,8 +1,5 @@
 import { randomUUID } from 'node:crypto';
 
-/** Stable, unique identifier assigned to each message at creation. */
-let _messageIdCounter = 0;
-
 /** Create a new message with a stable UUID. */
 export function createMessage(
     props: Omit<Message, 'id'>

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import { Message, createMessage, Stats } from './types.js';
 import { AppConfig } from './config/index.js';
@@ -105,22 +106,22 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                 const contentLength = msg.content?.length ?? 0;
                 if (contentLength > this.config.maxToolOutputSize && !msg.content?.startsWith("[Externalized to session context → ")) {
                     const outputId = `${randomUUID()}`;
-                    const outputPath = path.join(outputsDir, `${outputId}.txt`);
-                    // Atomic write: try exclusive create first, fall back to suffix loop
-                    let finalPath = outputPath;
-                    let written = false;
-                    try {
-                        fs.writeFileSync(finalPath, msg.content ?? '', { flag: 'wx', encoding: 'utf-8' });
-                        written = true;
-                    } catch (e: unknown) {
-                        if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-                            let suffix = 0;
-                            do {
-                                suffix++;
-                                finalPath = path.join(outputsDir, `${outputId}_${suffix}.txt`);
-                            } while (fs.existsSync(finalPath));
-                            fs.writeFileSync(finalPath, msg.content ?? '', 'utf-8');
-                        } else {
+                    let finalPath = path.join(outputsDir, `${outputId}.txt`);
+
+                    // Atomic write: try exclusive create first, then retry with unique suffixes.
+                    // Each retry uses a new UUID to avoid TOCTOU races from stale existence checks.
+                    for (let attempt = 0; attempt < 10; attempt++) {
+                        try {
+                            if (attempt > 0) {
+                                const retryId = `${randomUUID()}`;
+                                finalPath = path.join(outputsDir, `${retryId}.txt`);
+                            }
+                            await fsPromises.writeFile(finalPath, msg.content ?? '', { flag: 'wx', encoding: 'utf-8' });
+                            break;
+                        } catch (e: unknown) {
+                            if ((e as NodeJS.ErrnoException).code === 'EEXIST' && attempt < 9) {
+                                continue; // retry with new UUID
+                            }
                             throw e;
                         }
                     }

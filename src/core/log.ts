@@ -62,4 +62,13 @@ export async function closeLogger(): Promise<void> {
 // Flush logs on process exit to avoid losing buffered entries.
 // Use 'beforeExit' so the event loop can complete the async flush
 // before the process actually terminates.
-process.on('beforeExit', () => { void _logger?.flush(); });
+// Note: beforeExit fires synchronously; pino.flush(cb) is fire-and-forget.
+// The callback swallows errors to avoid unhandled rejections during shutdown.
+process.on('beforeExit', () => {
+    if (_logger) {
+        _logger.flush(() => {
+            // Best-effort flush — logger may already be in an error state;
+            // buffered entries may be lost on crash.
+        });
+    }
+});

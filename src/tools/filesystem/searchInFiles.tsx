@@ -139,7 +139,7 @@ export const searchInFiles: Tool<SearchInFilesArgs, SearchInFilesResult> = {
         return parseGrepOutput(stdout, stderrNote);
       } else if (code === 1) {
         // exit code 1 means no matches found.
-        return { success: true, matches: stderrNote ? [stderrNote] : [], truncated: false };
+        return { success: true, matches: [], truncated: false };
       } else if (code === 2 && stdout.trim()) {
         // exit code 2 means grep found matches but also hit errors (e.g., missing dirs).
         return parseGrepOutput(stdout, stderrNote);

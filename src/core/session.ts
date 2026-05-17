@@ -1,9 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { randomBytes } from 'node:crypto';
 import { Message } from './types.js';
 
-/** Generate a session ID as ISO timestamp + PID. */
+/** Generate a session ID as ISO timestamp + random hex + PID.
+ *  Random component prevents collision when the process restarts
+ *  within the same millisecond (e.g. crash recovery). */
 function generateSessionId(): string {
     const now = new Date();
     const y = now.getFullYear();
@@ -13,7 +16,8 @@ function generateSessionId(): string {
     const mi = String(now.getMinutes()).padStart(2, '0');
     const s = String(now.getSeconds()).padStart(2, '0');
     const ms = String(now.getMilliseconds()).padStart(3, '0');
-    return `${y}-${mo}-${d}T${h}${mi}${s}${ms}-${process.pid}`;
+    const rand = randomBytes(4).toString('hex');
+    return `${y}-${mo}-${d}T${h}${mi}${s}${ms}-${rand}-${process.pid}`;
 }
 
 export type SessionStats = {
@@ -60,15 +64,18 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
             const filePath = sessionFilePath(sessionId, cwd);
 
             try {
-                if (!fs.existsSync(filePath)) continue;
-                const mtime = fs.statSync(filePath).mtimeMs;
-                if (mtime <= latestTime) continue;
-
+                // Read directly and handle ENOENT — avoids the existsSync/statSync/
+                // readFileSync TOCTOU race where a file could be deleted between
+                // statSync and readFileSync.
                 const data = fs.readFileSync(filePath, 'utf-8');
+                const stat = fs.statSync(filePath);
+
+                if (stat.mtimeMs <= latestTime) continue;
+
                 const parsed = JSON.parse(data);
                 if (!parsed.messages || parsed.messages.length === 0) continue;
 
-                latestTime = mtime;
+                latestTime = stat.mtimeMs;
                 latest = sessionId;
             } catch {
                 // Skip individual session files that can't be read
@@ -158,15 +165,24 @@ export async function loadSession(directory: string = process.cwd()): Promise<Se
     return null;
 }
 
-export async function saveSession(session: Session, directory: string = process.cwd()): Promise<void> {
+export async function saveSession(session: Session, directory: string = process.cwd(), checkVersion: boolean = true): Promise<void> {
     const filePath = sessionFilePath(session.id, directory);
     const tempPath = filePath + TEMP_SUFFIX;
-    
+
     await ensureSessionDirForId(session.id, directory);
-    
+
     session.updatedAt = new Date().toISOString();
     session.version += 1;
-    
+
+    // Version check: prevent silent data loss from concurrent writes
+    if (checkVersion && fs.existsSync(filePath)) {
+        const existingData = fs.readFileSync(filePath, 'utf-8');
+        const existingSession = JSON.parse(existingData) as Session;
+        if (existingSession.version !== session.version - 1) {
+            throw new Error(`Version mismatch: expected ${session.version - 1}, got ${existingSession.version}. Session was modified by another process.`);
+        }
+    }
+
     const data = JSON.stringify(session, null, 2);
     fs.writeFileSync(tempPath, data, 'utf-8');
     fs.renameSync(tempPath, filePath);

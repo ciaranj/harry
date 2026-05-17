@@ -43,6 +43,11 @@ export const replaceContent: Tool<ReplaceContentArgs, ReplaceResult> = {
       return { success: false, message: `Missing required argument(s): ${missing.join(', ')}` };
     }
 
+    // Guard: empty search_string with regex matches every position → exponential output.
+    if (use_regex && search_string === '') {
+      return { success: false, message: `Empty search string is not valid for regex mode.` };
+    }
+
     try {
       const content = await readFile(p, 'utf-8');
 

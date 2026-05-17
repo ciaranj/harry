@@ -228,7 +228,9 @@ async function streamToCacheFile(
   } catch (err: any) {
     timedOut = true;
     if (!writeStream.closed) {
-      writeStream.destroy();
+      // Gracefully end the stream to flush remaining data instead of
+      // destroying it (which discards the write buffer).
+      writeStream.end();
     }
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -258,14 +260,14 @@ async function streamToCacheFile(
 // Read a byte range from a file
 // ---------------------------------------------------------------------------
 
-function readByteRange(filePath: string, start: number, limit: number): string {
-  const fd = fs.openSync(filePath, 'r');
+async function readByteRange(filePath: string, start: number, limit: number): Promise<string> {
+  const fd = await fsPromises.open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(limit);
-    const bytesRead = fs.readSync(fd, buffer, 0, limit, start);
+    const { bytesRead } = await fd.read(buffer, 0, limit, start);
     return buffer.toString('utf-8', 0, bytesRead);
   } finally {
-    fs.closeSync(fd);
+    await fd.close();
   }
 }
 
@@ -330,7 +332,7 @@ export const fetchUrl: Tool<FetchUrlArgs, FetchUrlResult> = {
       const limit = end_byte !== undefined
         ? Math.min(end_byte - byteStart + 1, cachedSize - byteStart)
         : 10000;
-      const content = readByteRange(cachedEntry.filePath, byteStart, limit);
+      const content = await readByteRange(cachedEntry.filePath, byteStart, limit);
       const truncated = cachedSize > byteStart + limit;
       const unreadBytes = Math.max(0, cachedSize - (byteStart + limit));
 
@@ -423,7 +425,7 @@ export const fetchUrl: Tool<FetchUrlArgs, FetchUrlResult> = {
       const limit = end_byte !== undefined
         ? Math.min(end_byte - byteStart + 1, actualSize - byteStart)
         : 10000;
-      const content = readByteRange(targetPath, byteStart, limit);
+      const content = await readByteRange(targetPath, byteStart, limit);
       const truncated = actualSize > byteStart + limit;
       const unreadBytes = Math.max(0, actualSize - (byteStart + limit));
 
