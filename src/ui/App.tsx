@@ -5,7 +5,7 @@ import { Message, Stats } from '../core/types.js';
 import { SessionStore } from '../core/session.js';
 import type pino from 'pino';
 import { CompactionStrategy, RunningMemoryStrategy } from '../core/compaction.js';
-import { tools as defaultTools, toolsByName } from '../tools/index.js';
+import { tools as defaultTools } from '../tools/index.js';
 import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
 
@@ -71,7 +71,7 @@ function wrapText(text: string, width: number): string[] {
     return result;
 }
 
-function getRenderLines(messages: Message[], width: number): RenderLine[] {
+function getRenderLines(messages: Message[], width: number, toolsByName: Record<string, any>): RenderLine[] {
     const lines: RenderLine[] = [];
     for (const msg of messages) {
         if (msg.role === 'tool') continue;
@@ -193,8 +193,9 @@ const reservedHeight = useMemo(() => {
     const terminalWidth = termWidth - 4;
 
     const renderLines = useMemo(() => {
-        return getRenderLines(messages, terminalWidth);
-    }, [messages, terminalWidth]);
+        const toolsByName = Object.fromEntries(tools.map((t: any) => [t.name, t]));
+        return getRenderLines(messages, terminalWidth, toolsByName);
+    }, [messages, terminalWidth, tools]);
 
     useEffect(() => {
         if (!isNavMode && !isConfirmingCancel) {
