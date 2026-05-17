@@ -89,7 +89,7 @@ function getRenderLines(messages: Message[], width: number, toolsByName: Record<
         }
         if (msg.tool_calls && msg.tool_calls.length > 0) {
             for (const tc of msg.tool_calls) {
-                const toolName = tc.function?.name || tc.name;
+                const toolName = tc.function?.name || tc.name || 'unknown';
                 const toolDef = toolsByName[toolName];
                 let description: string;
                 if (toolDef?.renderCallText) {

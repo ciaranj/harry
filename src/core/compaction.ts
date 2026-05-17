@@ -93,11 +93,11 @@ export class RunningMemoryStrategy implements CompactionStrategy {
             if (msg.role === 'user') {
                 compressed.push(msg);
             } else if (msg.role === 'assistant') {
-                const cleanMsg = createMessage({
+                const cleanMsg: Message = {
                     id: msg.id,  // preserve original ID for deduplication
                     role: 'assistant',
                     content: msg.content ?? '',
-                });
+                };
                 if (cleanMsg.content) {
                     compressed.push(cleanMsg);
                 }
@@ -127,12 +127,12 @@ export class RunningMemoryStrategy implements CompactionStrategy {
 
                     // Extract the UUID from the actual path for the retrieve message
                     const actualOutputId = path.basename(finalPath).replace('.txt', '');
-                    compressed.push(createMessage({
+                    compressed.push({
                         id: msg.id,  // preserve original ID for deduplication
                         role: 'tool',
                         content: `[Externalized to session context → use retrieve_tool_output("${actualOutputId}") to retrieve]`,
                         tool_call_id: msg.tool_call_id,
-                    }));
+                    });
                 } else {
                     compressed.push(msg);
                 }
