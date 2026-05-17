@@ -61,7 +61,7 @@ export class RunningMemoryStrategy implements CompactionStrategy {
 
     async doCompaction(store: SessionStore): Promise<CompactionResult> {
         const messages = store.getMessages();
-        if (messages.length <= this.config.recentTurns * 2) {
+        if (messages.length <= this.config.recentTurns * 4) {
             return {};
         }
 

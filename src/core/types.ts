@@ -13,12 +13,18 @@ export function createMessage(
     };
 }
 
+export interface ToolCall {
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+}
+
 export type Message = {
     id: string;
     role: 'user' | 'assistant' | 'tool' | 'system';
     content?: string;
     reasoning_content?: string;
-    tool_calls?: any[];
+    tool_calls?: ToolCall[];
     tool_call_id?: string;
 };
 
