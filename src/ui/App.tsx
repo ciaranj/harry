@@ -299,8 +299,12 @@ const reservedHeight = useMemo(() => {
             const currentTools = tools.length > 0 ? [...tools] : [];
             await makeCallToLLM(value, currentTools, setStats, store, compactionStrategy, guardrails, sessionLogger, abortControllerRef.current.signal);
         } catch (e) {
-            if (e instanceof Error && e.message === 'Aborted') setNotification("Turn abandoned.");
-            else console.log("Error:", e);
+            if (e instanceof Error && e.message === 'Aborted') {
+                setNotification("Turn abandoned.");
+            } else {
+                const msg = e instanceof Error ? e.message : String(e);
+                setNotification(`LLM call failed: ${msg}`);
+            }
         } finally {
             setIsProcessing(false);
             abortControllerRef.current = null;
