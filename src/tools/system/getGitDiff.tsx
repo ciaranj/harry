@@ -40,9 +40,11 @@ export const getGitDiff: Tool<GetGitDiffArgs, GitDiffResult> = {
           // Git diff exit codes:
           //   0 = changes found (success)
           //   1 = no changes (clean repo, success)
+          //   2 = ambiguous/other (treat as error — output may be unreliable)
           // 128 = fatal error (not a git repo, file not found)
-          //   2 = ambiguous/other (treat as success to avoid false negatives)
-          if (code === 128) {
+          if (code === 2) {
+            reject(new Error(capturedStderr || `git diff exited with code 2 (ambiguous error)`));
+          } else if (code === 128) {
             reject(new Error(capturedStderr || `git diff exited with code 128 (fatal)`));
           } else {
             resolve({ stdout: stdoutParts.join('') });

@@ -1,5 +1,6 @@
 import React from 'react';
 import { StringDecoder } from 'node:string_decoder';
+import { randomUUID } from 'node:crypto';
 import { Stats, Message, createMessage } from './types.js';
 import { SessionStore } from './session.js';
 import { CompactionStrategy } from './compaction.js';
@@ -109,7 +110,9 @@ async function* parseSseStream(
                         { partialLength: Buffer.byteLength(partialJson) },
                         'SSE partial JSON exceeded hard cap, resetting'
                     );
-                    partialJson = "";
+                    // Keep the last 4KB as a rolling window to avoid losing the tail end of a large fragment
+                    const lastBytes = 4096;
+                    partialJson = partialJson.slice(-lastBytes);
                     continue;
                 }
                 try {
@@ -359,7 +362,7 @@ export async function makeCallToLLM(
                     for (const tc of delta.tool_calls) {
                         if (!toolCallsAccum[tc.index]) {
                             toolCallsAccum[tc.index] = {
-                                id: tc.id,
+                                id: tc.id ?? randomUUID(),
                                 type: tc.type,
                                 function: { name: tc.function?.name, arguments: '' }
                             };
@@ -414,11 +417,19 @@ export async function makeCallToLLM(
 
         // --- Persistence & compaction ---
         currentStats.contextSize = currentStats.contextSize; // no-op, but keeps intent clear
-        await store.persist();
+        try {
+            await store.persist();
+        } catch (persistErr) {
+            logger.error({ error: String(persistErr) }, 'Failed to persist session (non-fatal)');
+        }
 
         if (compactionStrategy.shouldTrigger(store)) {
-            await compactionStrategy.doCompaction(store);
-            await store.persist();
+            try {
+                await compactionStrategy.doCompaction(store);
+                await store.persist();
+            } catch (compactErr) {
+                logger.error({ error: String(compactErr) }, 'Compaction failed (non-fatal)');
+            }
         }
 
         // --- End of round-trip ---

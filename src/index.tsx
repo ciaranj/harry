@@ -4,7 +4,7 @@ import { App } from './ui/App.js';
 import { makeCallToLLM } from './core/llm.js';
 import { loadSession, createSession, SessionStore } from './core/session.js';
 import { GuardrailConfigManager, createDefaultConfigStore } from './core/config/index.js';
-import { getLoggerInstance } from './core/log.js';
+import { getLoggerInstance, closeLogger } from './core/log.js';
 
 async function main() {
     const log = getLoggerInstance(process.cwd());
@@ -33,7 +33,16 @@ async function main() {
     const guardrails = new GuardrailConfigManager(configStore);
     sessionLogger.info('Guardrail config loaded');
 
-    render(<App makeCallToLLM={makeCallToLLM} store={store} sessionLogger={sessionLogger} guardrails={guardrails} />);
+    const { unmount } = render(<App makeCallToLLM={makeCallToLLM} store={store} sessionLogger={sessionLogger} guardrails={guardrails} />);
+
+    // Graceful shutdown: flush logs and unmount TUI on signal.
+    const shutdown = async () => {
+        unmount();
+        await closeLogger();
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
 }
 
 main();

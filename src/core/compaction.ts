@@ -105,11 +105,20 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                 if (contentLength > this.config.maxToolOutputSize && !msg.content?.startsWith("[Externalized to session context → ")) {
                     const outputId = `${randomUUID()}`;
                     const outputPath = path.join(outputsDir, `${outputId}.txt`);
-                    fs.writeFileSync(outputPath, msg.content ?? '', 'utf-8');
+                    // Dedup: if a file with this ID already exists, append a random suffix
+                    let finalPath = outputPath;
+                    let suffix = 0;
+                    while (fs.existsSync(finalPath)) {
+                        suffix++;
+                        finalPath = path.join(outputsDir, `${outputId}_${suffix}.txt`);
+                    }
+                    fs.writeFileSync(finalPath, msg.content ?? '', 'utf-8');
 
+                    // Extract the UUID from the actual path for the retrieve message
+                    const actualOutputId = path.basename(finalPath).replace('.txt', '');
                     compressed.push(createMessage({
                         role: 'tool',
-                        content: `[Externalized to session context → use retrieve_tool_output("${outputId}") to retrieve]`,
+                        content: `[Externalized to session context → use retrieve_tool_output("${actualOutputId}") to retrieve]`,
                         tool_call_id: msg.tool_call_id,
                     }));
                 } else {

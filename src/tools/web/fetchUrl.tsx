@@ -402,6 +402,18 @@ export const fetchUrl: Tool<FetchUrlArgs, FetchUrlResult> = {
         };
       }
 
+      // Non-2xx HTTP status
+      if (streamResult.status >= 400) {
+        return {
+          success: false,
+          content: `Error fetching URL "${url}": HTTP ${streamResult.status}`,
+          status: streamResult.status,
+          totalBytes: streamResult.totalBytes,
+          truncated: false,
+          unreadBytes: 0,
+        };
+      }
+
       // Read the requested byte range from the file
       if (!fs.existsSync(targetPath)) {
         return {

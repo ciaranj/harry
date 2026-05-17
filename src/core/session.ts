@@ -58,13 +58,8 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
             const sessionId = entry;
             const filePath = sessionFilePath(sessionId, cwd);
 
-            // TOCTOU note: between readdirSync/statSync/readFileSync and the
-            // subsequent loadSession/readSession calls, the file could be
-            // deleted or replaced. We accept this risk — the session directory
-            // is managed by this single process and is unlikely to be touched
-            // externally. The outer try/catch also handles ENOENT/EACCES
-            // gracefully, so the worst case is a silent skip.
-            if (fs.existsSync(filePath)) {
+            try {
+                if (!fs.existsSync(filePath)) continue;
                 const mtime = fs.statSync(filePath).mtimeMs;
                 if (mtime <= latestTime) continue;
 
@@ -74,6 +69,11 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
 
                 latestTime = mtime;
                 latest = sessionId;
+            } catch {
+                // Skip individual session files that can't be read
+                // (e.g., ENOENT, EACCES, JSON parse errors).
+                // Don't let a single bad session kill the whole scan.
+                continue;
             }
         }
     } catch {
@@ -369,7 +369,12 @@ export class SessionStore {
     /** Notify all registered listeners. */
     private notifyListeners(): void {
         for (const listener of this.listeners) {
-            listener();
+            try {
+                listener();
+            } catch {
+                // Swallow listener errors to prevent a crashing listener from
+                // breaking the entire update cycle (e.g., LLM loop, UI render).
+            }
         }
     }
 }

@@ -93,10 +93,14 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
 
           totalBytesRead += actualBytes;
 
+          // Use Buffer slicing to avoid splitting multibyte UTF-8 characters
+          const contentBytes = Buffer.from(content, 'utf-8');
+          const contentSlice = truncated ? contentBytes.slice(0, actualBytes).toString('utf-8') : content;
+
           results.push({
             path: entry.path,
             success: true,
-            content: truncated ? content.slice(0, Math.floor(actualBytes)) : content,
+            content: contentSlice,
             error: undefined,
             lineCount: undefined,
             truncated,
@@ -144,10 +148,14 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
 
           totalBytesRead += actualBytes;
 
+          // Use Buffer slicing to avoid splitting multibyte UTF-8 characters
+          const excerptBytes = Buffer.from(excerpt, 'utf-8');
+          const excerptSlice = truncated ? excerptBytes.slice(0, actualBytes).toString('utf-8') : excerpt;
+
           results.push({
             path: p,
             success: true,
-            content: truncated ? excerpt.slice(0, Math.floor(actualBytes)) : excerpt,
+            content: excerptSlice,
             error: undefined,
             lineCount: truncated ? undefined : e - s + 1,
             truncated,

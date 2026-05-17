@@ -43,6 +43,9 @@ export const writeToFile: Tool<WriteToFileArgs, WriteToFileResult> = {
   } as const,
   execute: async ({ path: p, content, mode = 'overwrite' }: WriteToFileArgs, _ctx?: ToolCallContext): Promise<WriteToFileResult> => {
     try {
+      // Ensure parent directory exists before writing
+      await ensureParentDir(p);
+
       if (mode === 'append') {
         await appendFile(p, content, 'utf-8');
         return { success: true, message: `Successfully appended to ${p}` };

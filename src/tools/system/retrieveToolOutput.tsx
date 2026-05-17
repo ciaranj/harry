@@ -43,6 +43,13 @@ export const retrieveToolOutput: Tool<RetrieveToolOutputArgs, RetrieveResult> = 
 
     const outputPath = path.join(outputsDir, `${outputId}.txt`);
 
+    // Prevent path traversal: resolve the actual path and verify it's still within outputsDir
+    const resolvedOutputPath = fs.realpathSync(outputPath) ?? outputPath;
+    const resolvedOutputsDir = fs.realpathSync(outputsDir) ?? outputsDir;
+    if (!resolvedOutputPath.startsWith(resolvedOutputsDir + path.sep)) {
+      return { success: false, content: `Output ID "${outputId}" resolved outside session context.` };
+    }
+
     if (!fs.existsSync(outputPath)) {
       return { success: false, content: `No tool output found with ID "${outputId}" in session context.` };
     }

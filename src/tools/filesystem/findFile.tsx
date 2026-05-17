@@ -37,9 +37,13 @@ export const findFile: Tool<FindFileArgs, FindFileResult> = {
       };
       const patternRegex = globToRegex(pattern);
       const results: string[] = [];
+      const visitedDirs = new Set<string>();
 
       const walk = async (currentDir: string, depth = 0) => {
         if (depth > 20) return;
+        const resolved = await fs.realpath(currentDir).catch(() => currentDir);
+        if (visitedDirs.has(resolved)) return;
+        visitedDirs.add(resolved);
         try {
           const entries = await fs.readdir(currentDir, { withFileTypes: true });
           for (const entry of entries) {

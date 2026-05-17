@@ -40,7 +40,13 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
           proc.kill();
         }
       });
-      proc.stderr.on('data', (d) => { stderr += d; });
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+        if (Buffer.byteLength(stderr) > maxOutput) {
+          stderr = stderr.slice(0, maxOutput) + '\n[STDERR TRUNCATED]';
+          proc.kill();
+        }
+      });
 
       const cleanupTimer = () => {
         if (timer) {

@@ -60,4 +60,6 @@ export async function closeLogger(): Promise<void> {
 }
 
 // Flush logs on process exit to avoid losing buffered entries.
-process.on('exit', () => { void _logger?.flush(); });
+// Use 'beforeExit' so the event loop can complete the async flush
+// before the process actually terminates.
+process.on('beforeExit', () => { void _logger?.flush(); });
