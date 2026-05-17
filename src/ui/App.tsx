@@ -164,18 +164,30 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
 
     const [termWidth, termHeight] = useStdoutDimensions();
 
-    const reservedHeight = useMemo(() => {
-        let height = 0;
-        height += 1;
-        height += 1;
-        height += 1;
-        height += 1;
-        height += 1;
-        height += 1;
-        if (notification) height += 2;
-        if (isConfirmingCancel) height += 2;
-        return height;
-    }, [notification, isConfirmingCancel]);
+    // Reserved UI height constants: each accounts for one terminal row.
+const RES = {
+    VIEWPORT_BORDER: 1,       // top border of conversation box
+    VIEWPORT_MARGIN: 1,       // marginBottom after conversation box
+    INPUT_AREA: 1,            // prompt + TextInput line
+    STATUS_MARGIN: 1,         // marginTop before status bar
+    STATUS_BORDER: 1,         // top border of status bar box
+    STATUS_CONTENT: 1,        // status info line
+    NOTIFICATION: 2,          // notification box (border + content)
+    CONFIRMATION: 2,          // cancel confirmation box (border + content)
+} as const;
+
+const reservedHeight = useMemo(() => {
+    let height = 0;
+    height += RES.VIEWPORT_BORDER;
+    height += RES.VIEWPORT_MARGIN;
+    height += RES.INPUT_AREA;
+    height += RES.STATUS_MARGIN;
+    height += RES.STATUS_BORDER;
+    height += RES.STATUS_CONTENT;
+    if (notification) height += RES.NOTIFICATION;
+    if (isConfirmingCancel) height += RES.CONFIRMATION;
+    return height;
+}, [notification, isConfirmingCancel]);
 
     const VIEWPORT_HEIGHT = Math.max(5, termHeight - reservedHeight);
     const terminalWidth = termWidth - 4;
