@@ -132,7 +132,8 @@ export class ConfigStore {
       const parsed = JSON.parse(raw) as RawConfig;
       if (parsed.version === undefined || !parsed.updatedAt) return null;
       return parsed;
-    } catch {
+    } catch (err) {
+      console.error(`[config] failed to load ${filePath}: ${String(err)}`);
       return null;
     }
   }

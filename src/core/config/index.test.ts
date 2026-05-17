@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import path from 'node:path';
 import { ConfigStore, GuardrailConfigManager, RawConfig, ConfigFileIO, parseEnv } from './index.js';
 
@@ -157,6 +157,20 @@ describe('ConfigStore', () => {
     expect(store.get()).toEqual(expect.objectContaining({ updatedAt: expect.any(String) }));
     expect(store.get('global')).toEqual(expect.objectContaining({ updatedAt: expect.any(String) }));
     expect(store.get('project')).toEqual(expect.objectContaining({ updatedAt: expect.any(String) }));
+  });
+
+  it('should log error and return null for malformed JSON', () => {
+    const errSpy = vi.spyOn(console, 'error');
+
+    // Write raw malformed JSON directly (not via setFile which JSON-stringifies)
+    io.getStore().set(globalPath, '{ not valid json');
+
+    const store = new ConfigStore({ resolver: resolver(), fileIO: io });
+    store.load();
+
+    // Should log the error
+    expect(errSpy).toHaveBeenCalled();
+    expect(errSpy.mock.calls[0][0]).toContain(globalPath);
   });
 
   it('should skip migration when scope is already at target version', () => {
