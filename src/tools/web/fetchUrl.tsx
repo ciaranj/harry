@@ -234,21 +234,13 @@ async function streamToCacheFile(
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 
-  // Wait for the write stream to finish flushing — only if not already ended
-  if (!streamEnded) {
-    await new Promise<void>((resolve, reject) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-      writeStream.end();
-    });
-  } else {
-    // Stream already ended — wait for it to fully flush
-    await new Promise<void>((resolve, reject) => {
-      writeStream.on('finish', resolve);
-      writeStream.on('error', reject);
-      // Don't call end() again — it was already called above
-    });
-  }
+  // Always wait for the write stream to flush — even if already ended,
+  // the drain may not have completed yet (finish event could be missed)
+  await new Promise<void>((resolve, reject) => {
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+    if (!streamEnded) writeStream.end();
+  });
 
   const actualBytes = fs.existsSync(filePath) ? (await fsPromises.stat(filePath)).size : 0;
 
