@@ -124,6 +124,40 @@ describe('searchInFiles', () => {
 
  // --- renderCallText tests ---
 
+    // --- literal search tests ---
+
+    it('should support literal (non-regex) search mode', async () => {
+        await writeFile('grep_test_literal.txt', 'foo.bar\nfooXbar\nfoo_bar', 'utf-8');
+
+        // With literal=true, 'foo.bar' should only match the exact string 'foo.bar', not 'fooXbar' or 'foo_bar'
+        const result = await searchInFiles.execute({ pattern: 'foo.bar', path: 'grep_test_literal.txt', literal: true });
+
+        expect(result.success).toBe(true);
+        expect(result.matches.some(m => m.includes('foo.bar'))).toBe(true);
+        expect(result.matches.some(m => m.includes('fooXbar'))).toBe(false);
+        expect(result.matches.some(m => m.includes('foo_bar'))).toBe(false);
+    });
+
+    it('should use regex mode by default (backward compatible)', async () => {
+        await writeFile('grep_test_regex_default.txt', 'foo.bar\nfooXbar\nfoo_bar', 'utf-8');
+
+        // Without literal flag, 'foo.bar' should match 'foo.bar', 'fooXbar', 'foo_bar' (regex . matches any char)
+        const result = await searchInFiles.execute({ pattern: 'foo.bar', path: 'grep_test_regex_default.txt' });
+
+        expect(result.success).toBe(true);
+        expect(result.matches.some(m => m.includes('Found 3 matches'))).toBe(true);
+    });
+
+    it('renderCallText should include literal mode indicator', () => {
+        const text = searchInFiles.renderCallText({ pattern: 'foo.bar', literal: true });
+        expect(text).toBe('Searching for "foo.bar" (literal) in .');
+    });
+
+    it('renderCallText should not show literal when mode is regex', () => {
+        const text = searchInFiles.renderCallText({ pattern: 'foo.bar', literal: false });
+        expect(text).toBe('Searching for "foo.bar" in .');
+    });
+
     it('renderCallText should show "Searching for" with default directory', () => {
         const text = searchInFiles.renderCallText({ pattern: 'hello' });
         expect(text).toBe('Searching for "hello" in .');

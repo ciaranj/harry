@@ -26,12 +26,14 @@ const runGrep = (args: string[]): Promise<{ stdout: string; stderr: string; code
 interface SearchInFilesArgs {
   pattern: string;
   path?: string;
+  literal?: boolean;
 }
 
 type SearchInFilesResult = { success: boolean; matches: string[]; truncated: boolean };
 
-function renderSearchInFilesCall(pattern: string, path?: string): string {
-  return `Searching for "${pattern}" in ${path || '.'}`;
+function renderSearchInFilesCall(pattern: string, path?: string, literal?: boolean): string {
+  const mode = literal ? ' (literal)' : '';
+  return `Searching for "${pattern}"${mode} in ${path || '.'}`;
 }
 
 // LLM-friendly output limits: cap per-file matches, total output lines, and line length to avoid context window bloat.
@@ -105,11 +107,12 @@ export const searchInFiles: Tool<SearchInFilesArgs, SearchInFilesResult> = {
     type: "object",
     properties: {
       pattern: { type: "string", description: "The regex pattern to search for." },
-      path: { type: "string", description: "The directory or file to search in." }
+      path: { type: "string", description: "The directory or file to search in." },
+      literal: { type: "boolean", description: "If true, treat pattern as a literal string (no regex). Defaults to false." }
     },
     required: ["pattern"]
   } as const,
-  execute: async ({ pattern, path: searchPath = '.' }: SearchInFilesArgs, _ctx?: ToolCallContext): Promise<SearchInFilesResult> => {
+  execute: async ({ pattern, path: searchPath = '.', literal = false }: SearchInFilesArgs, _ctx?: ToolCallContext): Promise<SearchInFilesResult> => {
     try {
       const excludedDirs = ['.h', '.git'];
       const excludeArgs = excludedDirs.flatMap(dir => ['--exclude-dir', dir]);
@@ -117,8 +120,11 @@ export const searchInFiles: Tool<SearchInFilesArgs, SearchInFilesResult> = {
       // Build the arguments array — passed directly to execvp, no shell interpretation.
       // -I: skip binary files (prevents garbled output)
       // --no-messages: suppress permission errors to stderr (surfaced below)
+      // -F: literal string match (when literal=true), -E: extended regex (default)
+      const modeFlag = literal ? ['-F'] : ['-E'];
       const args = [
-        '-rnE',
+        '-rn',
+        ...modeFlag,
         '-I',
         '--no-messages',
         ...excludeArgs,
@@ -150,11 +156,11 @@ export const searchInFiles: Tool<SearchInFilesArgs, SearchInFilesResult> = {
       return { success: false, matches: [], truncated: false };
     }
   },
-  renderCall: ({ pattern, path: searchPath }: SearchInFilesArgs) => (
-    <Text color="cyan">{renderSearchInFilesCall(pattern, searchPath)}</Text>
+  renderCall: ({ pattern, path: searchPath, literal }: SearchInFilesArgs) => (
+    <Text color="cyan">{renderSearchInFilesCall(pattern, searchPath, literal)}</Text>
   ),
-  renderCallText: ({ pattern, path: searchPath }: SearchInFilesArgs) =>
-    renderSearchInFilesCall(pattern, searchPath),
+  renderCallText: ({ pattern, path: searchPath, literal }: SearchInFilesArgs) =>
+    renderSearchInFilesCall(pattern, searchPath, literal),
   renderResult: (result: SearchInFilesResult) => (
     <Text color="gray">
       {result.success && result.matches.length > 0
