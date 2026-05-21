@@ -1,6 +1,9 @@
 import { AppConfig } from '../../core/config/index.js';
 
 const appConfig = AppConfig.getInstance();
+
+const DEFAULT_TIMEOUT_MS = 60_000; // 60 seconds
+
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
@@ -21,6 +24,33 @@ function renderSearchWebCall(query: string): string {
   return `Searching web for "${query}"`;
 }
 
+/** Wrap a fetch call with a timeout using AbortController. */
+function fetchWithTimeout(url: string, timeoutMs: number, signal?: AbortSignal): Promise<Response> {
+  if (signal?.aborted) {
+    return Promise.reject(new Error('fetch aborted'));
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  let controller: AbortController | null = null;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller?.abort();
+      reject(new Error(`fetch_url timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timeoutHandle!);
+    });
+  });
+
+  controller = new AbortController();
+  signal?.addEventListener('abort', () => {
+    controller?.abort();
+  });
+
+  return Promise.race([fetch(url, { signal: controller.signal }), timeoutPromise]) as Promise<Response>;
+}
+
 export const searchWeb: Tool<SearchWebArgs, SearchWebResult> = {
   name: "search_web",
   description: "Search the web using SearXNG.",
@@ -37,7 +67,8 @@ export const searchWeb: Tool<SearchWebArgs, SearchWebResult> = {
       const url = new URL('/search', baseUrl);
       url.searchParams.append('q', query);
       url.searchParams.append('format', 'json');
-      const res = await fetch(url.toString());
+      const timeoutMs = appConfig.getInt('WEB_FETCH_TIMEOUT_MS') || DEFAULT_TIMEOUT_MS;
+      const res = await fetchWithTimeout(url.toString(), timeoutMs, _ctx?.abortSignal);
       const data = await res.json();
       if (data.error) return { success: false, results: [] };
       if (!data.results?.length) return { success: true, results: [] };

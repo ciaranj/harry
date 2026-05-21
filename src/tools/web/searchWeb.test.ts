@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { searchWeb } from './searchWeb.js';
 
 describe('searchWeb', () => {
@@ -59,4 +59,29 @@ describe('searchWeb', () => {
         const text = searchWeb.renderCallText({ query: 'test & "quotes"' });
         expect(text).toBe('Searching web for "test & "quotes""');
     });
+
+    // --- timeout test ---
+
+    it('should timeout when SEARXNG is slow to respond', async () => {
+        vi.useFakeTimers();
+        const fetchSpy = vi.spyOn(global, 'fetch');
+
+        // Mock fetch to resolve after 120s (longer than the 60s default timeout)
+        fetchSpy.mockImplementation(
+            () => new Promise((resolve) =>
+                setTimeout(() => resolve({ ok: true, json: () => Promise.resolve({ results: [] }) }), 120000)
+            )
+        );
+
+        const result = searchWeb.execute({ query: 'timeout test' });
+        // Advance time past the 60s timeout
+        vi.advanceTimersByTime(61000);
+
+        const resolved = await result;
+
+        expect(resolved.success).toBe(false);
+        expect(resolved.results).toEqual([]);
+        fetchSpy.mockRestore();
+        vi.useRealTimers();
+    }, 5000);
 });
