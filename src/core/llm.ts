@@ -174,6 +174,7 @@ async function fetchWithTimeout(opts: LlmRequestOptions): Promise<Response> {
     const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
             if (!aborted) {
+                fetchController?.abort();
                 reject(new Error(`LLM request timeout after ${timeoutMs}ms`));
             }
         }, timeoutMs);
@@ -205,10 +206,9 @@ async function fetchWithTimeout(opts: LlmRequestOptions): Promise<Response> {
 
     const res = await Promise.race([fetchPromise, timeoutPromise]) as Response;
 
-    // Clean up timeout and listener — race resolved, no longer needed
+    // Clean up timeout — race resolved, no longer needed
     aborted = true;
     if (timeoutHandle) clearTimeout(timeoutHandle);
-    fetchController?.abort(); // Cancel any lingering fetch
 
     return res;
 }
