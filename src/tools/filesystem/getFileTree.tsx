@@ -3,6 +3,7 @@ import path from 'node:path';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { DEFAULT_IGNORE_PATTERNS } from './shared.js';
 
 interface GetFileTreeArgs {
   path: string;
@@ -34,7 +35,7 @@ export const getFileTree: Tool<GetFileTreeArgs, FileTreeResult> = {
     required: ["path"]
   } as const,
   execute: async (args: GetFileTreeArgs, _ctx?: ToolCallContext): Promise<FileTreeResult> => {
-    const { path: dirPath, max_depth = 3, ignore_patterns = ['.h', 'node_modules', '.git', 'build', 'dist'] } = args;
+    const { path: dirPath, max_depth = 3, ignore_patterns = [...DEFAULT_IGNORE_PATTERNS] } = args;
     try {
       const formatSize = (bytes: number): string => {
         if (bytes < 1024) return `${bytes}B`;

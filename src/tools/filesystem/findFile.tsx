@@ -1,10 +1,12 @@
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { DEFAULT_IGNORE_PATTERNS, shouldExclude } from './shared.js';
 
 interface FindFileArgs {
   pattern: string;
   path?: string;
+  ignore_patterns?: string[];
 }
 
 type FindFileResult = { success: boolean; files: string[] };
@@ -20,11 +22,12 @@ export const findFile: Tool<FindFileArgs, FindFileResult> = {
     type: "object",
     properties: {
       pattern: { type: "string", description: "The filename or pattern to search for." },
-      path: { type: "string", description: "The directory to start the search from." }
+      path: { type: "string", description: "The directory to start the search from." },
+      ignore_patterns: { type: "array", items: { type: "string" }, description: "List of directory names to ignore." }
     },
     required: ["pattern"]
   } as const,
-  execute: async ({ pattern, path: startPath = '.' }: FindFileArgs, _ctx?: ToolCallContext): Promise<FindFileResult> => {
+  execute: async ({ pattern, path: startPath = '.', ignore_patterns = [...DEFAULT_IGNORE_PATTERNS] }: FindFileArgs, _ctx?: ToolCallContext): Promise<FindFileResult> => {
     try {
       const fs = await import('node:fs/promises');
       const path = (await import('node:path')).default;
@@ -49,6 +52,7 @@ export const findFile: Tool<FindFileArgs, FindFileResult> = {
           for (const entry of entries) {
             const fullPath = path.join(currentDir, entry.name);
             if (entry.isDirectory()) {
+              if (shouldExclude(entry.name, ignore_patterns)) continue;
               if (entry.isSymbolicLink()) {
                 try {
                   const target = await fs.realpath(fullPath);

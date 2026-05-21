@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { DEFAULT_IGNORE_PATTERNS } from './shared.js';
 
 /**
  * Run grep via spawn (no shell), returning { stdout, stderr, code }.
@@ -27,6 +28,7 @@ interface SearchInFilesArgs {
   pattern: string;
   path?: string;
   literal?: boolean;
+  ignore_patterns?: string[];
 }
 
 type SearchInFilesResult = { success: boolean; matches: string[]; truncated: boolean };
@@ -108,14 +110,14 @@ export const searchInFiles: Tool<SearchInFilesArgs, SearchInFilesResult> = {
     properties: {
       pattern: { type: "string", description: "The regex pattern to search for." },
       path: { type: "string", description: "The directory or file to search in." },
-      literal: { type: "boolean", description: "If true, treat pattern as a literal string (no regex). Defaults to false." }
+      literal: { type: "boolean", description: "If true, treat pattern as a literal string (no regex). Defaults to false." },
+      ignore_patterns: { type: "array", items: { type: "string" }, description: "List of directory names to ignore." }
     },
     required: ["pattern"]
   } as const,
-  execute: async ({ pattern, path: searchPath = '.', literal = false }: SearchInFilesArgs, _ctx?: ToolCallContext): Promise<SearchInFilesResult> => {
+  execute: async ({ pattern, path: searchPath = '.', literal = false, ignore_patterns = [...DEFAULT_IGNORE_PATTERNS] }: SearchInFilesArgs, _ctx?: ToolCallContext): Promise<SearchInFilesResult> => {
     try {
-      const excludedDirs = ['.h', '.git'];
-      const excludeArgs = excludedDirs.flatMap(dir => ['--exclude-dir', dir]);
+      const excludeArgs = ignore_patterns.flatMap(dir => ['--exclude-dir', dir]);
 
       // Build the arguments array — passed directly to execvp, no shell interpretation.
       // -I: skip binary files (prevents garbled output)
