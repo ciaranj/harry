@@ -73,7 +73,7 @@ interface ToolsByName { [name: string]: any }
 // Subtracted from `width` when rendering markdown so wrapped lines line up.
 const PREFIX_GUTTER = 2;
 
-const MessageView = React.memo(function MessageView({ msg, width, toolsByName }: { msg: Message; width: number; toolsByName: ToolsByName }) {
+const MessageView = React.memo(function MessageView({ msg, width, toolsByName, showReasoning = false }: { msg: Message; width: number; toolsByName: ToolsByName; showReasoning?: boolean }) {
     // Tool result messages aren't rendered directly (their effect is shown via the tool call line above)
     if (msg.role === 'tool') return null;
 
@@ -90,7 +90,7 @@ const MessageView = React.memo(function MessageView({ msg, width, toolsByName }:
         [msg.content, innerWidth]
     );
 
-    const hasReasoning = !!msg.reasoning_content;
+    const hasReasoning = showReasoning && !!msg.reasoning_content;
     const hasOutput = !!content || (msg.tool_calls && msg.tool_calls.length > 0);
 
     return (
@@ -198,6 +198,7 @@ function ReviewView({
                         msg={msg}
                         width={width}
                         toolsByName={toolsByName}
+                        showReasoning
                     />
                 ))}
             </ScrollView>
@@ -315,6 +316,25 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
         const committedIds = new Set(committedMessages.map(m => m.id));
         return messages.filter(m => !committedIds.has(m.id));
     }, [messages, committedMessages]);
+
+    // Live reasoning: the in-flight assistant message's reasoning_content,
+    // rendered as an ephemeral block in the live area only. Stays on the
+    // Message object (for the LLM payload round-trip) but isn't rendered by
+    // MessageView in the main view — keeps Static/live render shapes
+    // identical so Ink doesn't double-print on commit. We also track the
+    // owning message id so the block can be interleaved immediately before
+    // its assistant message instead of floating at the top.
+    const liveReasoning = useMemo<{ text: string; msgId: string }>(() => {
+        if (!isProcessing) return { text: '', msgId: '' };
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (m.role === 'user') break;
+            if (m.role === 'assistant' && m.reasoning_content) {
+                return { text: m.reasoning_content, msgId: m.id };
+            }
+        }
+        return { text: '', msgId: '' };
+    }, [isProcessing, messages]);
 
     useEffect(() => {
         if (notification) {
@@ -465,12 +485,23 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 stacking would offset streaming messages relative to Static. */}
             <Box flexDirection="column">
                 {liveMessages.map((msg) => (
-                    <MessageView
-                        key={msg.id}
-                        msg={msg}
-                        width={contentWidth}
-                        toolsByName={toolsByName}
-                    />
+                    <React.Fragment key={msg.id}>
+                        {liveReasoning.msgId === msg.id && liveReasoning.text && (
+                            <Box paddingX={1} marginBottom={1}>
+                                <Box width={PREFIX_GUTTER} flexShrink={0}>
+                                    <Text color={theme.muted} dimColor>~</Text>
+                                </Box>
+                                <Box flexGrow={1}>
+                                    <Text color={theme.muted} dimColor>{liveReasoning.text}</Text>
+                                </Box>
+                            </Box>
+                        )}
+                        <MessageView
+                            msg={msg}
+                            width={contentWidth}
+                            toolsByName={toolsByName}
+                        />
+                    </React.Fragment>
                 ))}
 
                 {notification && (
