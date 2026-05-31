@@ -135,7 +135,7 @@ async function fetchWithTimeout(opts: LlmRequestOptions): Promise<Response> {
 export async function dispatchTool(
     name: string,
     args: Record<string, unknown>,
-    ctx?: { guardrails?: GuardrailConfigManager; sessionStore?: SessionStore }
+    ctx?: { guardrails?: GuardrailConfigManager; sessionStore?: SessionStore; abortSignal?: AbortSignal }
 ): Promise<string> {
     const tool = toolsByName[name];
     if (tool) {
@@ -245,6 +245,176 @@ function computeBackoff(attempt: number, baseDelayMs: number, jitterFactor: numb
 }
 
 // ---------------------------------------------------------------------------
+// streamOneTurn — one LLM fetch + SSE stream, with retry
+// ---------------------------------------------------------------------------
+
+interface RetryOpts {
+    maxRetries: number;
+    baseDelayMs: number;
+    jitterFactor: number;
+}
+
+interface StreamOneTurnResult {
+    toolCalls: ToolCallAccumulator[];
+    finishReason: string | undefined;
+    stats: Stats;
+}
+
+async function streamOneTurn(
+    body: string,
+    fetchUrl: string,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+    startTime: bigint,
+    setStats: React.Dispatch<React.SetStateAction<Stats>>,
+    store: SessionStore,
+    logger: pino.Logger,
+    retryOpts: RetryOpts
+): Promise<StreamOneTurnResult> {
+    const { maxRetries, baseDelayMs, jitterFactor } = retryOpts;
+    const tokenCount = { value: 0 };
+    const toolCalls: ToolCallAccumulator[] = [];
+    let finishReason: string | undefined;
+
+    const stats: Stats = { tokens: 0, tps: 0, status: 'sending', contextSize: 0, cachedContextSize: 0 };
+    setStats(() => ({ ...stats }));
+    store.setStats({ contextSize: 0 });
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        if (signal?.aborted) throw new Error("Aborted");
+
+        let res: Response;
+        try {
+            res = await fetchWithTimeout({ fetchUrl, body, signal, timeoutMs });
+        } catch (e) {
+            if (signal?.aborted) throw new Error("Aborted");
+            const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+            const isR = isRetryableError(e);
+            logger[isR ? 'warn' : 'error']({ attempt, durationMs, url: fetchUrl }, isR ? `LLM call failed (retryable): ${String(e)}` : `LLM call failed: ${String(e)}`);
+            if (!isR || attempt >= maxRetries) throw e;
+            const fetchDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
+            logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: fetchDelayMs }, `Retrying LLM call in ${Math.round(fetchDelayMs)}ms`);
+            await sleep(fetchDelayMs);
+            continue;
+        }
+
+        if (signal?.aborted) throw new Error("Aborted");
+
+        if (res.status !== 200) {
+            const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+            const retryable = /^5\d\d$/.test(String(res.status));
+            try { await res.text(); } catch { /* ignore */ }
+            logger[retryable ? 'warn' : 'error']({ status: res.status, url: fetchUrl, durationMs, retryable }, `LLM API error`);
+            if (!retryable || attempt >= maxRetries) throw new Error(`LLM error: ${res.status}`);
+            const httpDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
+            logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: httpDelayMs, status: res.status }, `Retrying LLM call in ${Math.round(httpDelayMs)}ms`);
+            await sleep(httpDelayMs);
+            continue;
+        }
+
+        if (!res.body) throw new Error("No response body");
+
+        try {
+            for await (const event of parseSseStream(res.body, logger)) {
+                if (signal?.aborted) throw new Error("Aborted");
+
+                const choice = event.choices?.[0];
+                const delta = choice?.delta;
+                if (!delta && !event.timings) continue;
+
+                if (event.timings && event.timings.prompt_n !== undefined) {
+                    const ctxSize = event.timings.prompt_n + (event.timings.cache_n ?? 0);
+                    stats.contextSize = ctxSize;
+                    stats.cachedContextSize = event.timings.cache_n ?? 0;
+                    setStats({ ...stats });
+                    store.setStats({ contextSize: ctxSize });
+                }
+
+                if (!delta) continue;
+
+                tokenCount.value++;
+                const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
+                const tps = elapsed > 0 ? tokenCount.value / elapsed : 0;
+
+                if (delta.reasoning_content) {
+                    stats.tokens = tokenCount.value;
+                    stats.tps = 0;
+                    stats.status = 'thinking';
+                    setStats({ ...stats });
+                    store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendReasoning(last, delta.reasoning_content!)));
+                }
+
+                if (delta.tool_calls) {
+                    stats.tokens = tokenCount.value;
+                    stats.tps = tps;
+                    stats.status = 'tool_calling';
+                    setStats({ ...stats });
+                    for (const tc of delta.tool_calls) {
+                        if (!toolCalls[tc.index]) {
+                            toolCalls[tc.index] = { id: tc.id ?? randomUUID(), type: tc.type, function: { name: tc.function?.name, arguments: '' } };
+                        }
+                        if (tc.function?.arguments) {
+                            toolCalls[tc.index].function.arguments += tc.function.arguments;
+                        }
+                    }
+                }
+
+                if (delta.content) {
+                    stats.tokens = tokenCount.value;
+                    stats.tps = tps;
+                    stats.status = 'generating';
+                    setStats({ ...stats });
+                    store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendContent(last, delta.content!)));
+                }
+
+                if (choice?.finish_reason === 'tool_calls') {
+                    finishReason = 'tool_calls';
+                }
+            }
+        } catch (e) {
+            if (signal?.aborted) throw new Error("Aborted");
+            const isR = isRetryableError(e);
+            if (!isR || attempt >= maxRetries) throw e;
+            const streamDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
+            logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: streamDelayMs }, `Retrying stream in ${Math.round(streamDelayMs)}ms`);
+            await sleep(streamDelayMs);
+            continue;
+        }
+
+        break; // stream completed successfully
+    }
+
+    return { toolCalls, finishReason, stats };
+}
+
+// ---------------------------------------------------------------------------
+// executeToolCalls — dispatch all tool calls and append results to store
+// ---------------------------------------------------------------------------
+
+async function executeToolCalls(
+    toolCalls: ToolCallAccumulator[],
+    store: SessionStore,
+    guardrails: GuardrailConfigManager,
+    signal: AbortSignal | undefined,
+    logger: pino.Logger,
+    startTime: bigint
+): Promise<void> {
+    store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => setToolCalls(last, toolCalls)));
+
+    for (const tc of toolCalls) {
+        try {
+            const args = JSON.parse(tc.function.arguments || '{}');
+            const result = await dispatchTool(tc.function.name || '', args, { guardrails, sessionStore: store, abortSignal: signal });
+            logger.debug({ tool: tc.function.name, tool_call_id: tc.id }, `Tool executed in ${Number(process.hrtime.bigint() - startTime) / 1e6}ms`);
+            store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(result) })]);
+        } catch (err) {
+            logger.error({ tool: tc.function.name, tool_call_id: tc.id, error: String(err) }, `Tool failed`);
+            store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(err) })]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -271,214 +441,43 @@ export async function makeCallToLLM(
     options?: MakeCallToLLMOptions
 ) {
     const maxLoops = options?.maxLoops ?? 100;
-    const logger = sessionLogger;
+    const fetchUrl = String(new URL('/v1/chat/completions', appConfig.getString('LLAMACPP_URL', 'http://localhost:8080/')));
+    const timeoutMs = appConfig.getInt('LLM_TIMEOUT_MS') || 600_000;
+    const retryOpts: RetryOpts = {
+        maxRetries: options?.maxRetries ?? 3,
+        baseDelayMs: options?.retryBaseDelayMs ?? 1000,
+        jitterFactor: options?.retryJitterFactor ?? 0.25,
+    };
 
     let loopCount = 0;
 
     while (loopCount < maxLoops) {
         loopCount++;
 
-        // --- Build payload ---
         if (message) {
             store.updateMessages(msgs => [...msgs, createMessage({ role: 'user', content: message })]);
         }
         message = undefined;
 
         const startTime = process.hrtime.bigint();
-        const tokenCount = { value: 0 };
-        let didToolCall = false;
-        const toolCallsAccum: ToolCallAccumulator[] = [];
+        const body = JSON.stringify(buildLLMPayload(store.getMessages(), toolsToOpenAITools(tools)));
 
-        const currentStats: Stats = {
-            tokens: 0,
-            tps: 0,
-            status: 'sending' as const,
-            contextSize: 0,
-            cachedContextSize: 0
-        };
-        setStats(() => currentStats);
-        store.setStats({ contextSize: currentStats.contextSize });
+        const { toolCalls, finishReason, stats } = await streamOneTurn(
+            body, fetchUrl, timeoutMs, signal, startTime, setStats, store, sessionLogger, retryOpts
+        );
 
-        const payload = buildLLMPayload(store.getMessages(), toolsToOpenAITools(tools));
-        const body = JSON.stringify(payload);
-        const chatUrl = new URL('/v1/chat/completions', appConfig.getString('LLAMACPP_URL', 'http://localhost:8080/'));
-        const fetchUrl = String(chatUrl);
-        const timeoutMs = appConfig.getInt('LLM_TIMEOUT_MS') || 600_000;
+        const didToolCall = finishReason === 'tool_calls' && toolCalls.length > 0;
 
-        // --- Fetch + stream with retry ---
-        let finishReason: string | undefined;
-        let streamCompleted = false;
-        const maxRetries = options?.maxRetries ?? 3;
-        const retryBaseDelayMs = options?.retryBaseDelayMs ?? 1000;
-        const retryJitterFactor = options?.retryJitterFactor ?? 0.25;
-
-        await (async () => {
-            for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                if (signal?.aborted) throw new Error("Aborted");
-
-                let res: Response;
-                 try {
-                    res = await fetchWithTimeout({ fetchUrl, body, signal, timeoutMs });
-                } catch (e) {
-                    // Check abort after catch completes
-                    if (signal?.aborted) throw new Error("Aborted");
-
-                    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
-                    const isR = isRetryableError(e);
-                    logger[isR ? 'warn' : 'error']({ attempt, durationMs, url: fetchUrl }, isR ? `LLM call failed (retryable): ${String(e)}` : `LLM call failed: ${String(e)}`);
-
-                    if (!isR || attempt >= maxRetries) {
-                        throw e;
-                    }
-
-                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
-                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs }, `Retrying LLM call in ${Math.round(delayMs)}ms`);
-                    await sleep(delayMs);
-                    continue;
-                }
-
-                // Check abort after fetch completes (in case it happened during fetch)
-                if (signal?.aborted) throw new Error("Aborted");
-
-                if (res.status !== 200) {
-                    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
-                    const retryable = /^5\d\d$/.test(String(res.status));
-                    let responseBody = '';
-                    try { responseBody = await res.text(); } catch { /* ignore */ }
-                    logger[retryable ? 'warn' : 'error']({ status: res.status, url: fetchUrl, durationMs, retryable }, `LLM API error`);
-
-                    if (!retryable || attempt >= maxRetries) {
-                        throw new Error(`LLM error: ${res.status}`);
-                    }
-
-                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
-                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs, status: res.status }, `Retrying LLM call in ${Math.round(delayMs)}ms`);
-                    await sleep(delayMs);
-                    continue;
-                }
-
-                // --- Stream processing ---
-                if (!res.body) {
-                    throw new Error("No response body");
-                }
-
-                try {
-                    for await (const event of parseSseStream(res.body, logger)) {
-                        if (signal?.aborted) throw new Error("Aborted");
-
-                        const choice = event.choices?.[0];
-                        const delta = choice?.delta;
-                        if (!delta && !event.timings) continue;
-
-                        // Update context/timing stats
-                        if (event.timings && event.timings.prompt_n !== undefined) {
-                            const ctxSize = event.timings.prompt_n + (event.timings.cache_n ?? 0);
-                            const cacheSize = event.timings.cache_n ?? 0;
-                            currentStats.contextSize = ctxSize;
-                            currentStats.cachedContextSize = cacheSize;
-                            setStats({ ...currentStats });
-                            store.setStats({ contextSize: ctxSize });
-                        }
-
-                        if (!delta) continue;
-
-                        tokenCount.value++;
-                        const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
-                        const tps = elapsed > 0 ? tokenCount.value / elapsed : 0;
-
-                        // --- Reasoning (per-token update for streaming display) ---
-                        if (delta.reasoning_content) {
-                            currentStats.tokens = tokenCount.value;
-                            currentStats.tps = 0;
-                            currentStats.status = 'thinking';
-                            setStats({ ...currentStats });
-
-                            store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendReasoning(last, delta.reasoning_content!)));
-                        }
-
-                        // --- Tool calls (buffered — one update at the end) ---
-                        if (delta.tool_calls) {
-                            currentStats.tokens = tokenCount.value;
-                            currentStats.tps = tps;
-                            currentStats.status = 'tool_calling';
-                            setStats({ ...currentStats });
-
-                            for (const tc of delta.tool_calls) {
-                                if (!toolCallsAccum[tc.index]) {
-                                    toolCallsAccum[tc.index] = {
-                                        id: tc.id ?? randomUUID(),
-                                        type: tc.type,
-                                        function: { name: tc.function?.name, arguments: '' }
-                                    };
-                                }
-                                if (tc.function?.arguments) {
-                                    toolCallsAccum[tc.index].function.arguments += tc.function.arguments;
-                                }
-                            }
-                        }
-
-                        // --- Content (per-token update for streaming display) ---
-                        if (delta.content) {
-                            currentStats.tokens = tokenCount.value;
-                            currentStats.tps = tps;
-                            currentStats.status = 'generating';
-                            setStats({ ...currentStats });
-
-                            store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendContent(last, delta.content!)));
-                        }
-
-                        // --- Finish ---
-                        if (choice?.finish_reason === 'tool_calls') {
-                            finishReason = 'tool_calls';
-                        }
-                    }
-                    streamCompleted = true;
-                } catch (e) {
-                    if (signal?.aborted) throw new Error("Aborted");
-                    const isR = isRetryableError(e);
-                    if (!isR || attempt >= maxRetries) {
-                        throw e;
-                    }
-
-                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
-                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs }, `Retrying stream in ${Math.round(delayMs)}ms`);
-                    await sleep(delayMs);
-                    continue;
-                }
-
-                // Stream completed successfully — break out of retry loop
-                break;
-            }
-        })();
-
-        // --- Tool execution loop (only if stream completed normally) ---
-        if (streamCompleted && finishReason === 'tool_calls' && toolCallsAccum.length > 0) {
-            currentStats.status = 'tool_running';
-            setStats({ ...currentStats });
-
-            // Finalize tool calls on the assistant message
-            store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => setToolCalls(last, toolCallsAccum)));
-
-            for (const tc of toolCallsAccum) {
-                try {
-                    const args = JSON.parse(tc.function.arguments || '{}');
-                    const result = await dispatchTool(tc.function.name || '', args, { guardrails, sessionStore: store, abortSignal: signal });
-                    logger.debug({ tool: tc.function.name, tool_call_id: tc.id }, `Tool executed in ${Number(process.hrtime.bigint() - startTime) / 1e6}ms`);
-                    store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(result) })]);
-                } catch (err) {
-                    logger.error({ tool: tc.function.name, tool_call_id: tc.id, error: String(err) }, `Tool failed`);
-                    store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(err) })]);
-                }
-            }
-            didToolCall = true;
+        if (didToolCall) {
+            stats.status = 'tool_running';
+            setStats({ ...stats });
+            await executeToolCalls(toolCalls, store, guardrails, signal, sessionLogger, startTime);
         }
 
-        // --- Persistence & compaction ---
-        currentStats.contextSize = currentStats.contextSize; // no-op, but keeps intent clear
         try {
             await store.persist();
         } catch (persistErr) {
-            logger.error({ error: String(persistErr) }, 'Failed to persist session (non-fatal)');
+            sessionLogger.error({ error: String(persistErr) }, 'Failed to persist session (non-fatal)');
         }
 
         if (compactionStrategy.shouldTrigger(store)) {
@@ -486,22 +485,20 @@ export async function makeCallToLLM(
                 await compactionStrategy.doCompaction(store);
                 await store.persist();
             } catch (compactErr) {
-                logger.error({ error: String(compactErr) }, 'Compaction failed (non-fatal)');
+                sessionLogger.error({ error: String(compactErr) }, 'Compaction failed (non-fatal)');
             }
         }
 
-        // --- End of round-trip ---
-        logStats(logger, startTime, 'complete', currentStats);
-        currentStats.tokens = tokenCount.value;
-        currentStats.tps = 0;
-        currentStats.status = 'idle';
-        setStats({ ...currentStats });
+        logStats(sessionLogger, startTime, 'complete', stats);
+        stats.tps = 0;
+        stats.status = 'idle';
+        setStats({ ...stats });
 
         if (!didToolCall) break;
     }
 
     if (loopCount >= maxLoops) {
-        logger.warn({ loopCount }, "LLM auto-loop hit max iteration limit");
+        sessionLogger.warn({ loopCount }, "LLM auto-loop hit max iteration limit");
         throw new Error("Too many loops");
     }
 }
