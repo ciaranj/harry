@@ -32,6 +32,7 @@ import { tools as defaultTools } from '../tools/index.js';
 import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
 import { ContextGauge } from './ContextGauge.js';
+import { theme } from './theme.js';
 
 const appConfig = AppConfig.getInstance();
 const MAX_CONTEXT_SIZE = appConfig.getInt('MAX_CONTEXT_SIZE', 262144);
@@ -76,8 +77,8 @@ const MessageView = React.memo(function MessageView({ msg, width, toolsByName }:
     // Tool result messages aren't rendered directly (their effect is shown via the tool call line above)
     if (msg.role === 'tool') return null;
 
-    const prefix = msg.role === 'user' ? '>' : msg.role === 'assistant' ? '*' : '?';
-    const prefixColor = msg.role === 'user' ? 'green' : msg.role === 'assistant' ? 'cyan' : 'yellow';
+    const prefix = msg.role === 'user' ? theme.glyph.user : msg.role === 'assistant' ? theme.glyph.assistant : theme.glyph.system;
+    const prefixColor = msg.role === 'user' ? theme.role.user : msg.role === 'assistant' ? theme.role.assistant : theme.role.system;
 
     const innerWidth = Math.max(20, width - PREFIX_GUTTER);
     // Skip re-parsing the markdown when content hasn't changed across re-renders.
@@ -97,10 +98,10 @@ const MessageView = React.memo(function MessageView({ msg, width, toolsByName }:
             {hasReasoning && (
                 <Box flexDirection="row">
                     <Box width={PREFIX_GUTTER} flexShrink={0}>
-                        <Text color="gray" dimColor>{prefix}</Text>
+                        <Text color={theme.muted} dimColor>{prefix}</Text>
                     </Box>
                     <Box flexGrow={1}>
-                        <Text color="gray" dimColor>{msg.reasoning_content}</Text>
+                        <Text color={theme.muted} dimColor>{msg.reasoning_content}</Text>
                     </Box>
                 </Box>
             )}
@@ -120,7 +121,7 @@ const MessageView = React.memo(function MessageView({ msg, width, toolsByName }:
                                 try { args = JSON.parse(tc.function?.arguments ?? '{}'); } catch { /* ignore */ }
                                 description = toolDef.renderCallText(args);
                             }
-                            return <Text key={`tc-${i}`}>🛠️  {description}</Text>;
+                            return <Text key={`tc-${i}`} color={theme.accent}>{theme.glyph.toolCall} {description}</Text>;
                         })}
                     </Box>
                 </Box>
@@ -186,9 +187,9 @@ function ReviewView({
 
     return (
         <Box flexDirection="column" height={height}>
-            <Box paddingX={1} borderStyle="single" borderColor="cyan">
-                <Text color="cyan" bold>REVIEW MODE</Text>
-                <Text color="gray">  ·  q/esc exit  ·  ↑↓ scroll  ·  PgUp/PgDn page  ·  g/G top/bottom</Text>
+            <Box paddingX={1} borderStyle="single" borderColor={theme.review}>
+                <Text color={theme.review} bold>REVIEW MODE</Text>
+                <Text color={theme.muted}>  ·  q/esc exit  ·  ↑↓ scroll  ·  PgUp/PgDn page  ·  g/G top/bottom</Text>
             </Box>
             <ScrollView ref={scrollRef} flexGrow={1} flexDirection="column">
                 {visibleMessages.map(msg => (
@@ -473,14 +474,14 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 ))}
 
                 {notification && (
-                    <Box marginBottom={1} borderStyle="single" borderColor="magenta" paddingX={1}>
-                        <Text color="magenta">{notification}</Text>
+                    <Box marginBottom={1} borderStyle="single" borderColor={theme.notification} paddingX={1}>
+                        <Text color={theme.notification}>{notification}</Text>
                     </Box>
                 )}
 
                 {isConfirmingCancel && (
-                    <Box marginBottom={1} borderStyle="double" borderColor="red" paddingX={1}>
-                        <Text color="red" bold>
+                    <Box marginBottom={1} borderStyle="double" borderColor={theme.danger} paddingX={1}>
+                        <Text color={theme.danger} bold>
                             {stats.status === 'idle'
                                 ? 'Are you sure you want to leave Harry? (y/N)'
                                 : 'Are you sure you want to cancel the current turn? (y/N)'}
@@ -491,14 +492,14 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 <Box
                     paddingX={1}
                     borderStyle="single"
-                    borderColor="gray"
+                    borderColor={theme.muted}
                     borderLeft={false}
                     borderRight={false}
                 >
-                    <Text color={isConfirmingCancel ? "red" : "white"} bold>
+                    <Text color={isConfirmingCancel ? theme.danger : theme.inputPrompt} bold>
                         {isConfirmingCancel
-                            ? (stats.status === 'idle' ? '[LEAVING] > ' : '[CANCELING] > ')
-                            : '> '}
+                            ? (stats.status === 'idle' ? `[LEAVING] ${theme.glyph.prompt} ` : `[CANCELING] ${theme.glyph.prompt} `)
+                            : `${theme.glyph.prompt} `}
                     </Text>
                     <TextInput
                         value={input}
@@ -514,17 +515,17 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 </Box>
 
                 <Box paddingX={1}>
-                    <Text color="gray">
-                        Status: <Text color="cyan">{stats.status.toUpperCase()}</Text> |
-                        Tokens: <Text color="cyan">{stats.tokens}</Text> |
-                        TPS: <Text color="cyan">{stats.tps.toFixed(1)}</Text> |
+                    <Text color={theme.muted}>
+                        Status: <Text color={theme.accent}>{stats.status.toUpperCase()}</Text> |
+                        Tokens: <Text color={theme.accent}>{stats.tokens}</Text> |
+                        TPS: <Text color={theme.accent}>{stats.tps.toFixed(1)}</Text> |
                         Context: <ContextGauge
                             used={stats.contextSize}
                             cached={stats.cachedContextSize}
                             max={MAX_CONTEXT_SIZE}
                             threshold={COMPACTION_THRESHOLD}
                         /> |
-                        <Text color="cyan"> Ctrl-R</Text> review
+                        <Text color={theme.accent}> Ctrl-R</Text> review
                     </Text>
                 </Box>
             </Box>

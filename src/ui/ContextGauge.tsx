@@ -1,5 +1,6 @@
 import React from 'react';
 import { Text } from 'ink';
+import { theme } from './theme.js';
 
 interface ContextGaugeProps {
     used: number;
@@ -17,7 +18,7 @@ export function ContextGauge({
 }: ContextGaugeProps) {
     const safeMax = Math.max(1, max);
     const usedFrac = Math.max(0, Math.min(1, used / safeMax));
-    const fillColor = usedFrac >= threshold ? 'red' : usedFrac >= 0.5 ? 'yellow' : 'cyan';
+    const fillColor = usedFrac >= threshold ? theme.gauge.danger : usedFrac >= 0.5 ? theme.gauge.warn : theme.gauge.calm;
 
     // Round usedCells against max, but split cached/live as a fraction of
     // *used* so cached stays visible even when total usage is small relative
@@ -54,10 +55,10 @@ export function ContextGauge({
         <Text>
             [<Text color={fillColor} dimColor>{'█'.repeat(cachedCells)}</Text>
             <Text color={fillColor}>{'█'.repeat(liveCells)}</Text>
-            <Text color="gray" dimColor>{'·'.repeat(beforeTick)}</Text>
-            {showTick && <Text color="yellow">│</Text>}
-            <Text color="gray" dimColor>{'·'.repeat(afterTick)}</Text>
-            ] <Text color={fillColor}>{fmt(used)}</Text>/<Text color="gray" dimColor>{fmt(max)}</Text>
+            <Text color={theme.muted} dimColor>{'·'.repeat(beforeTick)}</Text>
+            {showTick && <Text color={theme.gauge.threshold}>│</Text>}
+            <Text color={theme.muted} dimColor>{'·'.repeat(afterTick)}</Text>
+            ] <Text color={fillColor}>{fmt(used)}</Text>/<Text color={theme.muted} dimColor>{fmt(max)}</Text>
         </Text>
     );
 }
