@@ -1,6 +1,29 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Text, Box, useApp, useInput, useStdout } from 'ink';
+import { Text, Box, Static, useApp, useInput, useStdout } from 'ink';
 import TextInput from 'ink-text-input';
+import { ScrollView, type ScrollViewRef } from 'ink-scroll-view';
+import { Marked } from 'marked';
+import MarkedTerminalRenderer, { markedTerminal } from 'marked-terminal';
+
+// marked-terminal's listitem renderer drops inline formatting (**bold**, *em*,
+// `code`) inside list items: its `list` method calls `this.listitem(...)` on
+// the Renderer *instance*, bypassing extension-level overrides. The only way
+// to intercept is to patch the Renderer prototype before constructing it.
+// Walking the token's children with parseInline restores inline styling.
+(MarkedTerminalRenderer as any).prototype.listitem = function (token: any) {
+    let body = '';
+    for (const tok of token.tokens || []) {
+        if ((tok.type === 'text' || tok.type === 'paragraph') && Array.isArray(tok.tokens)) {
+            body += this.parser.parseInline(tok.tokens);
+            if (tok.type === 'paragraph') body += '\n';
+        } else {
+            body += this.parser.parse([tok]);
+        }
+    }
+    // '\n* ' matches marked-terminal's BULLET_POINT marker so the list-level
+    // renderer can later convert it for ordered lists.
+    return '\n* ' + body.replace(/\n+$/, '');
+};
 import { Message, Stats } from '../core/types.js';
 import { SessionStore } from '../core/session.js';
 import type pino from 'pino';
@@ -11,104 +34,174 @@ import { AppConfig } from '../core/config/index.js';
 
 const appConfig = AppConfig.getInstance();
 
-// --- UI Helpers ---
+// --- Markdown rendering via marked-terminal ---
+// marked-terminal's width affects table layout and (when reflowText is true)
+// paragraph wrapping. We cache one Marked instance per width so width changes
+// (terminal resize) take effect without rebuilding on every render.
+const renderers = new Map<number, Marked>();
+function getRenderer(width: number): Marked {
+    let r = renderers.get(width);
+    if (!r) {
+        r = new Marked();
+        r.use({ gfm: true, breaks: true } as any);
+        r.use(markedTerminal({
+            width,
+            reflowText: true,
+            showSectionPrefix: false,
+            emoji: false,
+        }) as any);
+        renderers.set(width, r);
+    }
+    return r;
+}
 
-function useStdoutDimensions(): [number, number] {
+function renderMarkdown(text: string, width: number): string {
+    try {
+        return String(getRenderer(width).parse(text)).replace(/\n+$/, '');
+    } catch {
+        return text;
+    }
+}
+
+interface ToolsByName { [name: string]: any }
+
+// Width of the left gutter that holds the role-prefix marker (e.g. `> ` or `* `).
+// Subtracted from `width` when rendering markdown so wrapped lines line up.
+const PREFIX_GUTTER = 2;
+
+const MessageView = React.memo(function MessageView({ msg, width, toolsByName }: { msg: Message; width: number; toolsByName: ToolsByName }) {
+    // Tool result messages aren't rendered directly (their effect is shown via the tool call line above)
+    if (msg.role === 'tool') return null;
+
+    const prefix = msg.role === 'user' ? '>' : msg.role === 'assistant' ? '*' : '?';
+    const prefixColor = msg.role === 'user' ? 'green' : msg.role === 'assistant' ? 'cyan' : 'yellow';
+
+    const innerWidth = Math.max(20, width - PREFIX_GUTTER);
+    // Skip re-parsing the markdown when content hasn't changed across re-renders.
+    // For the message currently streaming, content changes every tick (cache miss);
+    // for stable sibling messages this short-circuits the entire marked + ANSI
+    // pipeline.
+    const content = useMemo(
+        () => msg.content ? renderMarkdown(msg.content, innerWidth) : '',
+        [msg.content, innerWidth]
+    );
+
+    const hasReasoning = !!msg.reasoning_content;
+    const hasOutput = !!content || (msg.tool_calls && msg.tool_calls.length > 0);
+
+    return (
+        <Box flexDirection="column" paddingX={1} marginBottom={1}>
+            {hasReasoning && (
+                <Box flexDirection="row">
+                    <Box width={PREFIX_GUTTER} flexShrink={0}>
+                        <Text color="gray" dimColor>{prefix}</Text>
+                    </Box>
+                    <Box flexGrow={1}>
+                        <Text color="gray" dimColor>{msg.reasoning_content}</Text>
+                    </Box>
+                </Box>
+            )}
+            {hasOutput && (
+                <Box flexDirection="row">
+                    <Box width={PREFIX_GUTTER} flexShrink={0}>
+                        <Text color={prefixColor} bold>{prefix}</Text>
+                    </Box>
+                    <Box flexDirection="column" flexGrow={1}>
+                        {content && <Text>{content}</Text>}
+                        {msg.tool_calls?.map((tc, i) => {
+                            const toolName = tc.function?.name || tc.name || 'unknown';
+                            const toolDef = toolsByName[toolName];
+                            let description = toolName;
+                            if (toolDef?.renderCallText) {
+                                let args: any = {};
+                                try { args = JSON.parse(tc.function?.arguments ?? '{}'); } catch { /* ignore */ }
+                                description = toolDef.renderCallText(args);
+                            }
+                            return <Text key={`tc-${i}`}>🛠️  {description}</Text>;
+                        })}
+                    </Box>
+                </Box>
+            )}
+        </Box>
+    );
+});
+
+// --- Review mode: alt-screen overlay with scrollable history ---
+
+function ReviewView({
+    messages,
+    width,
+    height,
+    toolsByName,
+    onExit,
+}: {
+    messages: Message[];
+    width: number;
+    height: number;
+    toolsByName: ToolsByName;
+    onExit: () => void;
+}) {
+    const scrollRef = useRef<ScrollViewRef>(null);
     const { stdout } = useStdout();
-    const [dimensions, setDimensions] = useState<[number, number]>([stdout.columns ?? 80, stdout.rows ?? 24]);
+
+    // Skip tool result messages — MessageView returns null for them and that
+    // confuses ScrollView's height measurement.
+    const visibleMessages = useMemo(
+        () => messages.filter(m => m.role !== 'tool'),
+        [messages]
+    );
+
+    // Land on the most recent turn when the overlay opens.
     useEffect(() => {
-        const handler = () => setDimensions([stdout.columns, stdout.rows]);
-        stdout.on('resize', handler);
-        return () => { stdout.off('resize', handler); };
+        const t = setTimeout(() => scrollRef.current?.scrollToBottom(), 50);
+        return () => clearTimeout(t);
+    }, []);
+
+    useEffect(() => {
+        const onResize = () => scrollRef.current?.remeasure();
+        stdout.on('resize', onResize);
+        return () => { stdout.off('resize', onResize); };
     }, [stdout]);
-    return dimensions;
-}
 
-interface RenderLine {
-    content: string;
-    isHeader: boolean;
-    role: string;
-    isReasoning: boolean;
-}
-
-function wrapParagraph(text: string, width: number): string[] {
-    if (!text) return [' '];
-    const lines: string[] = [];
-    const words = text.split(/(\s+)/);
-    let currentLine = "";
-
-    for (const word of words) {
-        if ((currentLine + word).length <= width) {
-            currentLine += word;
-        } else {
-            if (currentLine) lines.push(currentLine.trimEnd());
-            if (word.length > width) {
-                let remaining = word;
-                while (remaining.length > width) {
-                    lines.push(remaining.substring(0, width));
-                    remaining = remaining.substring(width);
-                }
-                currentLine = remaining;
-            } else {
-                currentLine = word.trimStart();
-            }
+    useInput((input, key) => {
+        if (key.escape || input === 'q') { onExit(); return; }
+        if (key.upArrow)   { scrollRef.current?.scrollBy(-1); return; }
+        if (key.downArrow) { scrollRef.current?.scrollBy(1);  return; }
+        if (key.pageUp) {
+            const h = scrollRef.current?.getViewportHeight() ?? 1;
+            scrollRef.current?.scrollBy(-h);
+            return;
         }
-    }
-    if (currentLine) lines.push(currentLine.trimEnd());
-    return lines.length ? lines : [' '];
+        if (key.pageDown) {
+            const h = scrollRef.current?.getViewportHeight() ?? 1;
+            scrollRef.current?.scrollBy(h);
+            return;
+        }
+        if (input === 'g') { scrollRef.current?.scrollToTop(); return; }
+        if (input === 'G') { scrollRef.current?.scrollToBottom(); return; }
+    });
+
+    return (
+        <Box flexDirection="column" height={height}>
+            <Box paddingX={1} borderStyle="single" borderColor="cyan">
+                <Text color="cyan" bold>REVIEW MODE</Text>
+                <Text color="gray">  ·  q/esc exit  ·  ↑↓ scroll  ·  PgUp/PgDn page  ·  g/G top/bottom</Text>
+            </Box>
+            <ScrollView ref={scrollRef} flexGrow={1} flexDirection="column">
+                {visibleMessages.map(msg => (
+                    <MessageView
+                        key={msg.id}
+                        msg={msg}
+                        width={width}
+                        toolsByName={toolsByName}
+                    />
+                ))}
+            </ScrollView>
+        </Box>
+    );
 }
 
-function wrapText(text: string, width: number): string[] {
-    if (!text) return [];
-    const paragraphs = text.split('\n');
-    const result: string[] = [];
-    for (const para of paragraphs) {
-        result.push(...wrapParagraph(para, width));
-    }
-    while (result.length > 0 && result[result.length - 1].trim() === '') {
-        result.pop();
-    }
-    return result;
-}
-
-function getRenderLines(messages: Message[], width: number, toolsByName: Record<string, any>): RenderLine[] {
-    const lines: RenderLine[] = [];
-    for (const msg of messages) {
-        if (msg.role === 'tool') continue;
-        const roleLabel = msg.role === 'user' ? 'USER' : msg.role === 'assistant' ? 'ASSISTANT' : 'TOOL';
-        lines.push({ content: `[${roleLabel}]`, isHeader: true, role: msg.role, isReasoning: false });
-        if (msg.reasoning_content) {
-            for (const l of wrapText(msg.reasoning_content, width)) {
-                lines.push({ content: l, isHeader: false, role: msg.role, isReasoning: true });
-            }
-        }
-        if (msg.content) {
-            for (const l of wrapText(msg.content, width)) {
-                lines.push({ content: l, isHeader: false, role: msg.role, isReasoning: false });
-            }
-        }
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-            for (const tc of msg.tool_calls) {
-                const toolName = tc.function?.name || tc.name || 'unknown';
-                const toolDef = toolsByName[toolName];
-                let description: string;
-                if (toolDef?.renderCallText) {
-                    let args: any = {};
-                    try {
-                        args = JSON.parse(tc.function?.arguments ?? '{}');
-                    } catch { /* ignore */ }
-                    description = toolDef.renderCallText(args);
-                } else {
-                    description = toolName;
-                }
-                lines.push({ content: `🛠️ ${description}`, isHeader: false, role: msg.role, isReasoning: false });
-            }
-        }
-    }
-    return lines;
-}
-
-// --- App Component ---
+// --- Component ---
 
 interface AppProps {
     makeCallToLLM: (
@@ -126,33 +219,76 @@ interface AppProps {
     guardrails: GuardrailConfigManager;
 }
 
+function useStdoutDimensions(): [number, number] {
+    const { stdout } = useStdout();
+    const [dimensions, setDimensions] = useState<[number, number]>([stdout.columns ?? 80, stdout.rows ?? 24]);
+    useEffect(() => {
+        const handler = () => setDimensions([stdout.columns, stdout.rows]);
+        stdout.on('resize', handler);
+        return () => { stdout.off('resize', handler); };
+    }, [stdout]);
+    return dimensions;
+}
+
 export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProps) => {
     const initialMessages = store.getMessages();
     const [messages, setMessages] = useState<Message[]>(initialMessages);
+    const [committedMessages, setCommittedMessages] = useState<Message[]>(initialMessages);
     const [input, setInput] = useState('');
     const [isProcessing, setIsProcessing] = useState(false);
     const [stats, setStats] = useState<Stats>({ tokens: 0, tps: 0, status: 'idle', contextSize: store.getSnapshot().stats?.contextSize ?? 0, cachedContextSize: 0 });
     const [notification, setNotification] = useState<string | null>(null);
     const { exit } = useApp();
-    const [tools, setTools] = useState(defaultTools);
-    const [scrollOffset, setScrollOffset] = useState(0);
-    const [isNavMode, setIsNavMode] = useState(false);
+    const [tools] = useState(defaultTools);
     const [isConfirmingCancel, setIsConfirmingCancel] = useState(false);
+    const [isReviewing, setIsReviewing] = useState(false);
     const abortControllerRef = useRef<AbortController | null>(null);
     const suppressNextInputChange = useRef(false);
-    const compactionStrategy = new RunningMemoryStrategy();
+    const compactionStrategy = useMemo(() => new RunningMemoryStrategy(), []);
+    const { stdout } = useStdout();
 
-    const updateMessages = useCallback((updateFn: (msgs: Message[]) => Message[]) => {
-        const next = store.updateMessages(updateFn);
-        setMessages(next);
-        return next;
-    }, [store]);
+    // Safety net: if the process exits while in the alt buffer, restore the
+    // normal buffer so the user isn't left with a blank terminal. Runs on
+    // unmount (including Ctrl-C / process exit via Ink's lifecycle).
+    useEffect(() => {
+        return () => {
+            // Best-effort — if we never entered alt screen this is a no-op
+            // since the terminal ignores `1049l` when not in the alt buffer.
+            stdout.write('\x1b[?1049l');
+        };
+    }, [stdout]);
 
-    // Subscribe to store changes — when the store updates, sync React state
+    const enterReview = useCallback(() => {
+        // Switch to alt buffer + clear + cursor home BEFORE flipping state so
+        // Ink's next render lands on a clean canvas.
+        stdout.write('\x1b[?1049h\x1b[2J\x1b[H');
+        setIsReviewing(true);
+    }, [stdout]);
+
+    const exitReview = useCallback(() => {
+        // Restore the normal buffer first; Ink will then re-render the live
+        // tree into it on the next cycle.
+        stdout.write('\x1b[?1049l');
+        setIsReviewing(false);
+    }, [stdout]);
+
+    // Subscribe to store changes
     useEffect(() => {
         const unsub = store.subscribe(() => setMessages(store.getMessages()));
         return unsub;
     }, [store]);
+
+    // Commit completed messages to the static history when a turn ends.
+    // We track committed messages by ID so we never re-print or shuffle history,
+    // even when compaction rewrites the store's internal message list.
+    useEffect(() => {
+        if (isProcessing) return;
+        setCommittedMessages(prev => {
+            const seen = new Set(prev.map(m => m.id));
+            const additions = messages.filter(m => !seen.has(m.id));
+            return additions.length > 0 ? [...prev, ...additions] : prev;
+        });
+    }, [isProcessing, messages]);
 
     const persistSession = useCallback(async () => {
         try {
@@ -163,45 +299,18 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
     }, [store]);
 
     const [termWidth, termHeight] = useStdoutDimensions();
+    const contentWidth = Math.max(20, termWidth - 4);
 
-    // Reserved UI height constants: each accounts for one terminal row.
-const RES = {
-    VIEWPORT_BORDER: 1,       // top border of conversation box
-    VIEWPORT_MARGIN: 1,       // marginBottom after conversation box
-    INPUT_AREA: 1,            // prompt + TextInput line
-    STATUS_MARGIN: 1,         // marginTop before status bar
-    STATUS_BORDER: 1,         // top border of status bar box
-    STATUS_CONTENT: 1,        // status info line
-    NOTIFICATION: 2,          // notification box (border + content)
-    CONFIRMATION: 2,          // cancel confirmation box (border + content)
-} as const;
+    const toolsByName = useMemo(
+        () => Object.fromEntries(tools.map((t: any) => [t.name, t])),
+        [tools]
+    );
 
-const reservedHeight = useMemo(() => {
-    let height = 0;
-    height += RES.VIEWPORT_BORDER;
-    height += RES.VIEWPORT_MARGIN;
-    height += RES.INPUT_AREA;
-    height += RES.STATUS_MARGIN;
-    height += RES.STATUS_BORDER;
-    height += RES.STATUS_CONTENT;
-    if (notification) height += RES.NOTIFICATION;
-    if (isConfirmingCancel) height += RES.CONFIRMATION;
-    return height;
-}, [notification, isConfirmingCancel]);
-
-    const VIEWPORT_HEIGHT = Math.max(5, termHeight - reservedHeight);
-    const terminalWidth = termWidth - 4;
-
-    const renderLines = useMemo(() => {
-        const toolsByName = Object.fromEntries(tools.map((t: any) => [t.name, t]));
-        return getRenderLines(messages, terminalWidth, toolsByName);
-    }, [messages, terminalWidth, tools]);
-
-    useEffect(() => {
-        if (!isNavMode && !isConfirmingCancel) {
-            setScrollOffset(Math.max(0, renderLines.length - VIEWPORT_HEIGHT));
-        }
-    }, [renderLines.length, isNavMode, isConfirmingCancel]);
+    // Live messages: anything in the store not yet committed to <Static>
+    const liveMessages = useMemo(() => {
+        const committedIds = new Set(committedMessages.map(m => m.id));
+        return messages.filter(m => !committedIds.has(m.id));
+    }, [messages, committedMessages]);
 
     useEffect(() => {
         if (notification) {
@@ -211,6 +320,9 @@ const reservedHeight = useMemo(() => {
     }, [notification]);
 
     useInput((input, key) => {
+        // While review mode is up, let ReviewView own the keyboard.
+        if (isReviewing) return;
+
         if (isConfirmingCancel) {
             if (input.toLowerCase() === 'y') {
                 if (stats.status === 'idle') exit();
@@ -221,18 +333,17 @@ const reservedHeight = useMemo(() => {
             return;
         }
 
-        if (isNavMode) {
-            if (key.upArrow) setScrollOffset((prev) => Math.max(0, prev - 1));
-            else if (key.downArrow) {
-                const maxScroll = Math.max(0, renderLines.length - VIEWPORT_HEIGHT);
-                setScrollOffset((prev) => Math.min(maxScroll, prev + 1));
-            } else if (key.escape || input === '') setIsNavMode(false);
-        } else {
-            if (key.escape) { setIsConfirmingCancel(true); return; }
-            if (key.ctrl && input === 'n') {
-                suppressNextInputChange.current = true;
-                setIsNavMode(true);
-            }
+        // Ctrl-R: enter scrollable review of the conversation.
+        if (!isProcessing && key.ctrl && input === 'r') {
+            suppressNextInputChange.current = true;
+            enterReview();
+            return;
+        }
+
+        if (key.escape) {
+            setIsConfirmingCancel(true);
+            suppressNextInputChange.current = true;
+            return;
         }
     });
 
@@ -253,6 +364,9 @@ const reservedHeight = useMemo(() => {
         if (value === '/reset') {
             await store.reset();
             setMessages(store.getMessages());
+            // The pre-reset history stays visible in scrollback. Clear our
+            // committed cache so future messages start a fresh visual block.
+            setCommittedMessages([]);
             setIsProcessing(false);
             setStats({ tokens: 0, tps: 0, status: 'idle', contextSize: 0, cachedContextSize: 0 });
             setInput('');
@@ -260,10 +374,14 @@ const reservedHeight = useMemo(() => {
         }
 
         if (value === '/compact') {
-            // This command forces a compact, regardless of whether 'shouldTrigger' would've fired
             const preCompactMessageLength = store.getMessages().length;
             const result = await compactionStrategy.doCompaction(store);
             const postCompactMessageLength = store.getMessages().length;
+            // After compaction the store holds new summary messages with new IDs.
+            // The pre-compaction history is already in the terminal's scrollback;
+            // treat the post-compaction set as already-committed so the new
+            // summary messages don't appear as if they were a fresh turn.
+            setCommittedMessages(store.getMessages());
             let msg = `Compacted: ${preCompactMessageLength} → ${postCompactMessageLength} messages`;
             if (result.contextMdPath) {
                 msg += ` | wrote ${result.contextMdPath}`;
@@ -312,83 +430,96 @@ const reservedHeight = useMemo(() => {
         }
     };
 
-    const visibleLines = useMemo(() => {
-        const lines = renderLines.slice(scrollOffset, scrollOffset + VIEWPORT_HEIGHT);
-        const pad = VIEWPORT_HEIGHT - lines.length;
-        const empty: RenderLine = { content: ' ', isHeader: false, role: 'user', isReasoning: false };
-        if (pad > 0) return [...lines, ...Array(pad).fill(empty)];
-        return lines;
-    }, [renderLines, scrollOffset, VIEWPORT_HEIGHT]);
+    if (isReviewing) {
+        return (
+            <ReviewView
+                messages={messages}
+                width={contentWidth}
+                height={termHeight}
+                toolsByName={toolsByName}
+                onExit={exitReview}
+            />
+        );
+    }
 
     return (
-        <Box flexDirection="column" padding={0}>
-            <Box
-                flexDirection="column"
-                height={VIEWPORT_HEIGHT}
-                borderStyle="single"
-                borderColor={isNavMode ? "yellow" : isConfirmingCancel ? "red" : "gray"}
-                marginBottom={1}
-            >
-                {visibleLines.length === 0 ? (
-                    <Text color="gray" dimColor>No messages yet. Type something below!</Text>
-                ) : (
-                    visibleLines.map((line, i) => (
-                        <Text
-                            key={i}
-                            color={
-                                line.isHeader
-                                    ? (line.role === 'user' ? 'green' : line.role === 'assistant' ? 'cyan' : 'yellow')
-                                    : (line.isReasoning ? 'gray' : 'white')
-                            }
-                            bold={line.isHeader}
-                            italic={line.isReasoning}
-                        >
-                            {line.content}
-                        </Text>
-                    ))
+        <>
+            {/* Committed history — rendered once each, kept in the terminal scrollback. */}
+            <Static items={committedMessages}>
+                {(msg) => (
+                    <MessageView
+                        key={msg.id}
+                        msg={msg}
+                        width={contentWidth}
+                        toolsByName={toolsByName}
+                    />
                 )}
-            </Box>
+            </Static>
 
-            {notification && (
-                <Box marginBottom={1} borderStyle="single" borderColor="magenta">
-                    <Text color="magenta" dimColor> {notification} </Text>
+            {/* Live area: in-flight turn + UI chrome. Re-renders freely.
+                No paddingX here — MessageView already provides 1 col, and
+                stacking would offset streaming messages relative to Static. */}
+            <Box flexDirection="column">
+                {liveMessages.map((msg) => (
+                    <MessageView
+                        key={msg.id}
+                        msg={msg}
+                        width={contentWidth}
+                        toolsByName={toolsByName}
+                    />
+                ))}
+
+                {notification && (
+                    <Box marginBottom={1} borderStyle="single" borderColor="magenta" paddingX={1}>
+                        <Text color="magenta">{notification}</Text>
+                    </Box>
+                )}
+
+                {isConfirmingCancel && (
+                    <Box marginBottom={1} borderStyle="double" borderColor="red" paddingX={1}>
+                        <Text color="red" bold>
+                            {stats.status === 'idle'
+                                ? 'Are you sure you want to leave Harry? (y/N)'
+                                : 'Are you sure you want to cancel the current turn? (y/N)'}
+                        </Text>
+                    </Box>
+                )}
+
+                <Box
+                    paddingX={1}
+                    borderStyle="single"
+                    borderColor="gray"
+                    borderLeft={false}
+                    borderRight={false}
+                >
+                    <Text color={isConfirmingCancel ? "red" : "white"} bold>
+                        {isConfirmingCancel
+                            ? (stats.status === 'idle' ? '[LEAVING] > ' : '[CANCELING] > ')
+                            : '> '}
+                    </Text>
+                    <TextInput
+                        value={input}
+                        onChange={(val) => {
+                            if (suppressNextInputChange.current) {
+                                suppressNextInputChange.current = false;
+                                return;
+                            }
+                            setInput(val);
+                        }}
+                        onSubmit={handleInput}
+                    />
                 </Box>
-            )}
 
-            {isConfirmingCancel && (
-                <Box marginBottom={1} borderStyle="double" borderColor="red">
-                    <Text color="red" bold>
-                        {stats.status === 'idle'
-                            ? 'Are you sure you want to leave Harry? (y/N)'
-                            : 'Are you sure you want to cancel the current turn? (y/N)'}
+                <Box paddingX={1}>
+                    <Text color="gray">
+                        Status: <Text color="cyan">{stats.status.toUpperCase()}</Text> |
+                        Tokens: <Text color="cyan">{stats.tokens}</Text> |
+                        TPS: <Text color="cyan">{stats.tps.toFixed(1)}</Text> |
+                        Context: <Text color="cyan">{stats.contextSize} ({stats.cachedContextSize} cached)</Text> |
+                        <Text color="cyan"> Ctrl-R</Text> review
                     </Text>
                 </Box>
-            )}
-
-            <Box>
-                <Text color={isNavMode ? "yellow" : isConfirmingCancel ? "red" : "white"} bold>{isNavMode ? '[NAV MODE] > ' : isConfirmingCancel ? stats.status == 'idle' ? '[LEAVING] >': '[CANCELING] > ' : '> '}</Text>
-                <TextInput
-                    value={input}
-                    onChange={(val) => {
-                        if (suppressNextInputChange.current) {
-                            suppressNextInputChange.current = false;
-                            return;
-                        }
-                        setInput(val);
-                    }}
-                    onSubmit={handleInput}
-                />
             </Box>
-
-            <Box borderStyle="round" borderColor="gray" marginTop={1} paddingX={1}>
-                <Text color="gray">
-                    {isNavMode ? "MODE: NAVIGATION (Arrows to scroll)" : "MODE: INPUT"} |
-                    Status: <Text color="cyan">{stats.status.toUpperCase()}</Text> |
-                    Tokens: <Text color="cyan">{stats.tokens}</Text> |
-                    TPS: <Text color="cyan">{stats.tps.toFixed(1)}</Text> |
-                    Context: <Text color="cyan">{stats.contextSize} ({stats.cachedContextSize} cached)</Text>
-                </Text>
-            </Box>
-        </Box>
+        </>
     );
 };
