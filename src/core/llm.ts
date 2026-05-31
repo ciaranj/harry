@@ -1,11 +1,11 @@
 import React from 'react';
-import { StringDecoder } from 'node:string_decoder';
 import { randomUUID } from 'node:crypto';
 import { Stats, Message, createMessage } from './types.js';
 import { SessionStore } from './session.js';
 import { CompactionStrategy } from './compaction.js';
 import { buildLLMPayload } from '../utils.js';
 import { AppConfig } from './config/index.js';
+import { parseSseStream } from './llm-sse-parser.js';
 
 
 const appConfig = AppConfig.getInstance();
@@ -56,96 +56,11 @@ export async function connectToServer(url: string, logger?: Logger): Promise<boo
 }
 
 // ---------------------------------------------------------------------------
-// SSE stream parser — yields parsed SSE events
+// SSE stream parser — imported from llm-sse-parser.ts
 // ---------------------------------------------------------------------------
 
-interface SseEvent {
-    timings?: { prompt_n?: number; cache_n?: number };
-    choices?: Array<{
-        delta?: {
-            content?: string;
-            reasoning_content?: string;
-            tool_calls?: Array<{
-                index: number;
-                id?: string;
-                type?: string;
-                function?: { name?: string; arguments?: string };
-            }>;
-        };
-        finish_reason?: string;
-    }>;
-}
-
-/**
- * Parses a SSE stream and yields parsed events.
- * Handles partial lines across chunks via a buffer, and accumulates
- * incomplete JSON fragments that span multiple network chunks.
- */
-const MAX_PARTIAL_JSON_BYTES = 1024 * 1024; // 1 MB hard cap on accumulated partial JSON
-const PARTIAL_JSON_TIMEOUT_MS = 30_000; // 30 seconds — reset if accumulating too long
-
-async function* parseSseStream(
-    body: ReadableStream,
-    logger: Logger
-): AsyncIterable<SseEvent> {
-    const decoder = new StringDecoder('utf8');
-    let buffer = "";
-    let partialJson = "";
-
-    let partialJsonStart = Date.now();
-    for await (const chunk of body) {
-        const now = Date.now();
-        if (partialJson && (now - partialJsonStart) > PARTIAL_JSON_TIMEOUT_MS) {
-            // Don't discard accumulated data — try to emit it as-is.
-            // Large streaming responses (e.g. long tool outputs) can legitimately
-            // take >30s to stream; discarding would corrupt the response.
-            partialJsonStart = now;
-        }
-        buffer += decoder.write(chunk);
-        partialJsonStart = now;
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            const trimmed = line.trim();
-            const data = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed;
-            if (data === '[DONE]') return;
-
-            if (data.startsWith('{') || data.startsWith('[')) {
-                partialJson += data;
-                // Hard cap to prevent memory exhaustion on very long cross-chunk fragments
-                if (Buffer.byteLength(partialJson) > MAX_PARTIAL_JSON_BYTES) {
-                    logger.warn(
-                        { partialLength: Buffer.byteLength(partialJson) },
-                        'SSE partial JSON exceeded hard cap, resetting'
-                    );
-                    // Keep the last 4KB as a rolling window to avoid losing the tail end of a large fragment
-                    const lastBytes = 4096;
-                    partialJson = partialJson.slice(-lastBytes);
-                    continue;
-                }
-                try {
-                    yield JSON.parse(partialJson) as SseEvent;
-                    partialJson = "";
-                } catch {
-                    // incomplete JSON fragment — accumulate more data.
-                    // Log for observability; track how often this actually occurs.
-                    const truncated = partialJson.length > 120 ? partialJson.slice(0, 120) + '…' : partialJson;
-                    logger.warn(
-                        { data: String(data), partial: truncated },
-                        'SSE partial JSON (cross-chunk fragment)'
-                    );
-                }
-            } else if (partialJson) {
-                // Only accumulate non-JSON lines if we're already in the middle of a
-                // partial JSON fragment. Standalone SSE fields like "retry:5000" would
-                // corrupt the buffer if accumulated blindly.
-                partialJson += data;
-            }
-        }
-    }
-}
+// (parseSseStream, SseEvent, MAX_PARTIAL_JSON_BYTES, PARTIAL_JSON_TIMEOUT_MS)
+// are now exported from ./llm-sse-parser.ts
 
 // ---------------------------------------------------------------------------
 // HTTP request with timeout
