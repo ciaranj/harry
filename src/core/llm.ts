@@ -284,12 +284,64 @@ function logStats(logger: pino.Logger, startTime: bigint, label: string, stats: 
 }
 
 // ---------------------------------------------------------------------------
+// Retry with exponential backoff
+// ---------------------------------------------------------------------------
+
+/**
+ * Sleep for a given number of milliseconds.
+ */
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Determine whether an error is retryable (transient network / server errors).
+ */
+function isRetryableError(err: unknown): boolean {
+    if (err instanceof Error) {
+        // Network-level failures
+        if (err.message.includes('fetch') || err.message.includes('NetworkError') || err.message.includes('ECONNREFUSED')) {
+            return true;
+        }
+        // Timeout errors are retryable
+        if (err.message.includes('timeout') || err.message.includes('timed out')) {
+            return true;
+        }
+        // HTTP 5xx errors
+        if (err.message.startsWith('LLM error: 5')) {
+            return true;
+        }
+    }
+    // If the error message contains common transient indicators
+    if (typeof err === 'string' && /timeout|network|5\d\d|refused|reset/i.test(err)) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Calculate the backoff delay for a given retry attempt (0-indexed).
+ * Uses exponential backoff with random jitter to prevent thundering herd.
+ */
+function computeBackoff(attempt: number, baseDelayMs: number, jitterFactor: number): number {
+    const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
+    const jitter = Math.random() * jitterFactor * baseDelayMs * Math.pow(2, attempt);
+    return exponentialDelay + jitter;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
 export interface MakeCallToLLMOptions {
     /** Maximum number of LLM round-trips in the auto-loop (default: 100). */
     maxLoops?: number;
+    /** Maximum number of retries per LLM round-trip before failing (default: 3). */
+    maxRetries?: number;
+    /** Base delay in ms for exponential backoff (default: 1000). */
+    retryBaseDelayMs?: number;
+    /** Maximum jitter factor to spread retry times (0-1, default: 0.25). */
+    retryJitterFactor?: number;
 }
 
 export async function makeCallToLLM(
@@ -338,107 +390,151 @@ export async function makeCallToLLM(
         const fetchUrl = String(chatUrl);
         const timeoutMs = appConfig.getInt('LLM_TIMEOUT_MS') || 600_000;
 
-        let res: Response;
-        try {
-            res = await fetchWithTimeout({ fetchUrl, body, signal, timeoutMs });
-        } catch (e) {
-            const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
-            logger.error({ durationMs, url: fetchUrl }, `LLM call failed: ${String(e)}`);
-            throw e;
-        }
-
-        if (res.status !== 200) {
-            const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
-            let responseBody = '';
-            try { responseBody = await res.text(); } catch { /* ignore */ }
-            logger.error({ status: res.status, url: fetchUrl, durationMs: durationMs }, `LLM API error`);
-            throw new Error(`LLM error: ${res.status}`);
-        }
-
-        // --- Stream processing ---
-        if (!res.body) {
-            throw new Error("No response body");
-        }
-
- 
+        // --- Fetch + stream with retry ---
         let finishReason: string | undefined;
         let streamCompleted = false;
+        const maxRetries = options?.maxRetries ?? 3;
+        const retryBaseDelayMs = options?.retryBaseDelayMs ?? 1000;
+        const retryJitterFactor = options?.retryJitterFactor ?? 0.25;
 
-        try {
-            for await (const event of parseSseStream(res.body, logger)) {
+        await (async () => {
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
                 if (signal?.aborted) throw new Error("Aborted");
 
-                const choice = event.choices?.[0];
-                const delta = choice?.delta;
-                if (!delta && !event.timings) continue;
+                let res: Response;
+                 try {
+                    res = await fetchWithTimeout({ fetchUrl, body, signal, timeoutMs });
+                } catch (e) {
+                    // Check abort after catch completes
+                    if (signal?.aborted) throw new Error("Aborted");
 
-                // Update context/timing stats
-                if (event.timings && event.timings.prompt_n !== undefined) {
-                    const ctxSize = event.timings.prompt_n + (event.timings.cache_n ?? 0);
-                    const cacheSize = event.timings.cache_n ?? 0;
-                    currentStats.contextSize = ctxSize;
-                    currentStats.cachedContextSize = cacheSize;
-                    setStats({ ...currentStats });
-                    store.setStats({ contextSize: ctxSize });
+                    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+                    const isR = isRetryableError(e);
+                    logger[isR ? 'warn' : 'error']({ attempt, durationMs, url: fetchUrl }, isR ? `LLM call failed (retryable): ${String(e)}` : `LLM call failed: ${String(e)}`);
+
+                    if (!isR || attempt >= maxRetries) {
+                        throw e;
+                    }
+
+                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
+                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs }, `Retrying LLM call in ${Math.round(delayMs)}ms`);
+                    await sleep(delayMs);
+                    continue;
                 }
 
-                if (!delta) continue;
+                // Check abort after fetch completes (in case it happened during fetch)
+                if (signal?.aborted) throw new Error("Aborted");
 
-                tokenCount.value++;
-                const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
-                const tps = elapsed > 0 ? tokenCount.value / elapsed : 0;
+                if (res.status !== 200) {
+                    const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
+                    const retryable = /^5\d\d$/.test(String(res.status));
+                    let responseBody = '';
+                    try { responseBody = await res.text(); } catch { /* ignore */ }
+                    logger[retryable ? 'warn' : 'error']({ status: res.status, url: fetchUrl, durationMs, retryable }, `LLM API error`);
 
-                // --- Reasoning (per-token update for streaming display) ---
-                if (delta.reasoning_content) {
-                    currentStats.tokens = tokenCount.value;
-                    currentStats.tps = 0;
-                    currentStats.status = 'thinking';
-                    setStats({ ...currentStats });
+                    if (!retryable || attempt >= maxRetries) {
+                        throw new Error(`LLM error: ${res.status}`);
+                    }
 
-                    store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendReasoning(last, delta.reasoning_content!)));
+                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
+                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs, status: res.status }, `Retrying LLM call in ${Math.round(delayMs)}ms`);
+                    await sleep(delayMs);
+                    continue;
                 }
 
-                // --- Tool calls (buffered — one update at the end) ---
-                if (delta.tool_calls) {
-                    currentStats.tokens = tokenCount.value;
-                    currentStats.tps = tps;
-                    currentStats.status = 'tool_calling';
-                    setStats({ ...currentStats });
+                // --- Stream processing ---
+                if (!res.body) {
+                    throw new Error("No response body");
+                }
 
-                    for (const tc of delta.tool_calls) {
-                        if (!toolCallsAccum[tc.index]) {
-                            toolCallsAccum[tc.index] = {
-                                id: tc.id ?? randomUUID(),
-                                type: tc.type,
-                                function: { name: tc.function?.name, arguments: '' }
-                            };
+                try {
+                    for await (const event of parseSseStream(res.body, logger)) {
+                        if (signal?.aborted) throw new Error("Aborted");
+
+                        const choice = event.choices?.[0];
+                        const delta = choice?.delta;
+                        if (!delta && !event.timings) continue;
+
+                        // Update context/timing stats
+                        if (event.timings && event.timings.prompt_n !== undefined) {
+                            const ctxSize = event.timings.prompt_n + (event.timings.cache_n ?? 0);
+                            const cacheSize = event.timings.cache_n ?? 0;
+                            currentStats.contextSize = ctxSize;
+                            currentStats.cachedContextSize = cacheSize;
+                            setStats({ ...currentStats });
+                            store.setStats({ contextSize: ctxSize });
                         }
-                        if (tc.function?.arguments) {
-                            toolCallsAccum[tc.index].function.arguments += tc.function.arguments;
+
+                        if (!delta) continue;
+
+                        tokenCount.value++;
+                        const elapsed = Number(process.hrtime.bigint() - startTime) / 1e9;
+                        const tps = elapsed > 0 ? tokenCount.value / elapsed : 0;
+
+                        // --- Reasoning (per-token update for streaming display) ---
+                        if (delta.reasoning_content) {
+                            currentStats.tokens = tokenCount.value;
+                            currentStats.tps = 0;
+                            currentStats.status = 'thinking';
+                            setStats({ ...currentStats });
+
+                            store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendReasoning(last, delta.reasoning_content!)));
+                        }
+
+                        // --- Tool calls (buffered — one update at the end) ---
+                        if (delta.tool_calls) {
+                            currentStats.tokens = tokenCount.value;
+                            currentStats.tps = tps;
+                            currentStats.status = 'tool_calling';
+                            setStats({ ...currentStats });
+
+                            for (const tc of delta.tool_calls) {
+                                if (!toolCallsAccum[tc.index]) {
+                                    toolCallsAccum[tc.index] = {
+                                        id: tc.id ?? randomUUID(),
+                                        type: tc.type,
+                                        function: { name: tc.function?.name, arguments: '' }
+                                    };
+                                }
+                                if (tc.function?.arguments) {
+                                    toolCallsAccum[tc.index].function.arguments += tc.function.arguments;
+                                }
+                            }
+                        }
+
+                        // --- Content (per-token update for streaming display) ---
+                        if (delta.content) {
+                            currentStats.tokens = tokenCount.value;
+                            currentStats.tps = tps;
+                            currentStats.status = 'generating';
+                            setStats({ ...currentStats });
+
+                            store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendContent(last, delta.content!)));
+                        }
+
+                        // --- Finish ---
+                        if (choice?.finish_reason === 'tool_calls') {
+                            finishReason = 'tool_calls';
                         }
                     }
+                    streamCompleted = true;
+                } catch (e) {
+                    if (signal?.aborted) throw new Error("Aborted");
+                    const isR = isRetryableError(e);
+                    if (!isR || attempt >= maxRetries) {
+                        throw e;
+                    }
+
+                    const delayMs = computeBackoff(attempt, retryBaseDelayMs, retryJitterFactor);
+                    logger.debug({ attempt, nextAttempt: attempt + 1, delayMs }, `Retrying stream in ${Math.round(delayMs)}ms`);
+                    await sleep(delayMs);
+                    continue;
                 }
 
-                // --- Content (per-token update for streaming display) ---
-                if (delta.content) {
-                    currentStats.tokens = tokenCount.value;
-                    currentStats.tps = tps;
-                    currentStats.status = 'generating';
-                    setStats({ ...currentStats });
-
-                    store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => appendContent(last, delta.content!)));
-                }
-
-                // --- Finish ---
-                if (choice?.finish_reason === 'tool_calls') {
-                    finishReason = 'tool_calls';
-                }
+                // Stream completed successfully — break out of retry loop
+                break;
             }
-        } catch (e) {
-            if (signal?.aborted) throw new Error("Aborted");
-            throw e;
-        }
-        streamCompleted = true;
+        })();
 
         // --- Tool execution loop (only if stream completed normally) ---
         if (streamCompleted && finishReason === 'tool_calls' && toolCallsAccum.length > 0) {
