@@ -24,9 +24,18 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
     },
     required: ["code"]
   } as const,
-  execute: async ({ code }: RunPythonArgs, _ctx?: ToolCallContext): Promise<PythonResult> => {
+  execute: async ({ code }: RunPythonArgs, ctx?: ToolCallContext): Promise<PythonResult> => {
+    if (ctx?.abortSignal?.aborted) {
+      return { success: false, output: 'Python execution aborted' };
+    }
     return new Promise((resolve) => {
       const proc = spawn('ipython', ['--no-banner', '--no-confirm-exit', '-c', code]);
+
+      const onAbort = () => {
+        proc.kill();
+        resolve({ success: false, output: 'Python execution aborted' });
+      };
+      ctx?.abortSignal?.addEventListener('abort', onAbort, { once: true });
       let stdout = '', stderr = '';
       const maxOutput = 1024 * 1024; // 1MB cap to prevent OOM
       let stdoutTruncated = false;
@@ -72,6 +81,7 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
 
       proc.on('close', (exitCode) => {
         cleanupTimer();
+        ctx?.abortSignal?.removeEventListener('abort', onAbort);
         if (timedOut) {
           resolve({ success: false, output: 'Python execution timed out (60s)' });
         } else if (exitCode !== 0 && stderr) {
@@ -83,6 +93,7 @@ export const runPython: Tool<RunPythonArgs, PythonResult> = {
 
       proc.on('error', (e) => {
         cleanupTimer();
+        ctx?.abortSignal?.removeEventListener('abort', onAbort);
         resolve({ success: false, output: `Failed to launch ipython: ${e.message}` });
       });
 

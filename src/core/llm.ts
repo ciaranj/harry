@@ -462,7 +462,7 @@ export async function makeCallToLLM(
             for (const tc of toolCallsAccum) {
                 try {
                     const args = JSON.parse(tc.function.arguments || '{}');
-                    const result = await dispatchTool(tc.function.name || '', args, { guardrails, sessionStore: store });
+                    const result = await dispatchTool(tc.function.name || '', args, { guardrails, sessionStore: store, abortSignal: signal });
                     logger.debug({ tool: tc.function.name, tool_call_id: tc.id }, `Tool executed in ${Number(process.hrtime.bigint() - startTime) / 1e6}ms`);
                     store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(result) })]);
                 } catch (err) {
