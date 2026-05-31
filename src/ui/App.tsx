@@ -33,10 +33,12 @@ import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
 import { ContextGauge } from './ContextGauge.js';
 import { theme } from './theme.js';
+import { useEditorInput } from './useEditorInput.js';
 
 const appConfig = AppConfig.getInstance();
 const MAX_CONTEXT_SIZE = appConfig.getInt('MAX_CONTEXT_SIZE', 262144);
 const COMPACTION_THRESHOLD = appConfig.getFloat('AUTO_COMPACTION_THRESHOLD', 0.8);
+
 
 // --- Markdown rendering via marked-terminal ---
 // marked-terminal's width affects table layout and (when reflowText is true)
@@ -249,6 +251,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
     const [isReviewing, setIsReviewing] = useState(false);
     const abortControllerRef = useRef<AbortController | null>(null);
     const suppressNextInputChange = useRef(false);
+    const { isEditing, textInputKey } = useEditorInput({ input, setInput, setNotification, isProcessing, suppressNextInputChange });
     const compactionStrategy = useMemo(() => new RunningMemoryStrategy(), []);
     const { stdout } = useStdout();
 
@@ -343,12 +346,12 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
         }
     }, [notification]);
 
-    useInput((input, key) => {
+    useInput((char, key) => {
         // While review mode is up, let ReviewView own the keyboard.
         if (isReviewing) return;
 
         if (isConfirmingCancel) {
-            if (input.toLowerCase() === 'y') {
+            if (char.toLowerCase() === 'y') {
                 if (stats.status === 'idle') exit();
                 else abortControllerRef.current?.abort();
             }
@@ -358,7 +361,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
         }
 
         // Ctrl-R: enter scrollable review of the conversation.
-        if (!isProcessing && key.ctrl && input === 'r') {
+        if (!isProcessing && key.ctrl && char === 'r') {
             suppressNextInputChange.current = true;
             enterReview();
             return;
@@ -533,9 +536,10 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                             : `${theme.glyph.prompt} `}
                     </Text>
                     <TextInput
+                        key={textInputKey}
                         value={input}
                         onChange={(val) => {
-                            if (suppressNextInputChange.current) {
+                            if (suppressNextInputChange.current || isEditing) {
                                 suppressNextInputChange.current = false;
                                 return;
                             }
@@ -556,7 +560,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                             max={MAX_CONTEXT_SIZE}
                             threshold={COMPACTION_THRESHOLD}
                         /> |
-                        <Text color={theme.accent}> Ctrl-R</Text> review
+                        <Text color={theme.accent}> Ctrl-R</Text> review  <Text color={theme.accent}> Ctrl-E</Text> editor
                     </Text>
                 </Box>
             </Box>
