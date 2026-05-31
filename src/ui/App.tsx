@@ -31,8 +31,11 @@ import { CompactionStrategy, RunningMemoryStrategy } from '../core/compaction.js
 import { tools as defaultTools } from '../tools/index.js';
 import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
+import { ContextGauge } from './ContextGauge.js';
 
 const appConfig = AppConfig.getInstance();
+const MAX_CONTEXT_SIZE = appConfig.getInt('MAX_CONTEXT_SIZE', 262144);
+const COMPACTION_THRESHOLD = appConfig.getFloat('AUTO_COMPACTION_THRESHOLD', 0.8);
 
 // --- Markdown rendering via marked-terminal ---
 // marked-terminal's width affects table layout and (when reflowText is true)
@@ -515,7 +518,12 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                         Status: <Text color="cyan">{stats.status.toUpperCase()}</Text> |
                         Tokens: <Text color="cyan">{stats.tokens}</Text> |
                         TPS: <Text color="cyan">{stats.tps.toFixed(1)}</Text> |
-                        Context: <Text color="cyan">{stats.contextSize} ({stats.cachedContextSize} cached)</Text> |
+                        Context: <ContextGauge
+                            used={stats.contextSize}
+                            cached={stats.cachedContextSize}
+                            max={MAX_CONTEXT_SIZE}
+                            threshold={COMPACTION_THRESHOLD}
+                        /> |
                         <Text color="cyan"> Ctrl-R</Text> review
                     </Text>
                 </Box>
