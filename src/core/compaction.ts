@@ -143,9 +143,6 @@ export class RunningMemoryStrategy implements CompactionStrategy {
         // Combine: compressed older + recent uncompressed (full fidelity)
         const newMessages = [...compressed, ...recentMessages];
 
-        // Bump version so trySaveSession's version check succeeds after compaction.
-        store.incrementVersion();
-
         // Mutate the store directly — the store notifies its subscribers
         store.updateMessages(() => newMessages);
 
