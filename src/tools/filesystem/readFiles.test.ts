@@ -1,22 +1,30 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFiles } from './readFiles.js';
-import { writeFile, unlink, stat } from 'node:fs/promises';
-import { mkdtemp } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile, unlink, stat, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+
+const TEST_DIR = './_rf_test_files';
 
 describe('readFiles', () => {
     const testFiles: string[] = [];
 
     beforeEach(async () => {
         process.env.MODEL = 'test-model';
+        try { await mkdir(TEST_DIR, { recursive: true }); } catch { /* ignore */ }
     });
 
     afterEach(async () => {
         for (const file of testFiles) {
             try { await unlink(file); } catch { /* ignore */ }
         }
+        try { await mkdir(TEST_DIR, { recursive: true }); /* cleanup dir */ } catch { /* ignore */ }
     });
+
+    function tmpPath(name: string): string {
+        const p = path.join(TEST_DIR, name);
+        testFiles.push(p);
+        return p;
+    }
 
     it('should return empty array for empty input', async () => {
         const result = await readFiles.execute({ paths: [] });
@@ -274,11 +282,9 @@ describe('readFiles', () => {
     // --- Truncation / 20KB limit tests ---
 
     it('should read a small file within the 20KB limit without truncation', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const smallFile = path.join(tmpDir, 'small.txt');
+        const smallFile = tmpPath('small.txt');
         const content = 'x'.repeat(100);
         await writeFile(smallFile, content);
-        testFiles.push(smallFile);
 
         const result = await readFiles.execute({ paths: [{ path: smallFile }] });
 
@@ -290,11 +296,9 @@ describe('readFiles', () => {
     });
 
     it('should truncate a single file that exceeds the 20KB limit', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const largeFile = path.join(tmpDir, 'large.txt');
+        const largeFile = tmpPath('large.txt');
         const content = 'x'.repeat(25 * 1024); // 25KB
         await writeFile(largeFile, content);
-        testFiles.push(largeFile);
 
         const result = await readFiles.execute({ paths: [{ path: largeFile }] });
 
@@ -306,14 +310,12 @@ describe('readFiles', () => {
     });
 
     it('should mark all subsequent files as truncated once limit is reached', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const file1 = path.join(tmpDir, 'file1.txt');
-        const file2 = path.join(tmpDir, 'file2.txt');
-        const file3 = path.join(tmpDir, 'file3.txt');
+        const file1 = tmpPath('file1.txt');
+        const file2 = tmpPath('file2.txt');
+        const file3 = tmpPath('file3.txt');
 
         // file1 fits within limit
         await writeFile(file1, 'x'.repeat(1024));
-        testFiles.push(file1, file2, file3);
 
         // file2 and file3 are large
         await writeFile(file2, 'y'.repeat(30 * 1024));
@@ -341,13 +343,11 @@ describe('readFiles', () => {
     });
 
     it('should mark files within the limit as not truncated', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const fileA = path.join(tmpDir, 'fileA.txt');
-        const fileB = path.join(tmpDir, 'fileB.txt');
+        const fileA = tmpPath('fileA.txt');
+        const fileB = tmpPath('fileB.txt');
 
         await writeFile(fileA, 'A'.repeat(5 * 1024));
         await writeFile(fileB, 'B'.repeat(5 * 1024));
-        testFiles.push(fileA, fileB);
 
         const result = await readFiles.execute({ paths: [{ path: fileA }, { path: fileB }] });
 
@@ -361,12 +361,10 @@ describe('readFiles', () => {
     });
 
     it('should handle line-range reads with truncation', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const file = path.join(tmpDir, 'range.txt');
+        const file = tmpPath('range.txt');
         // Create a file that's ~15KB
         const content = 'x'.repeat(15 * 1024);
         await writeFile(file, content);
-        testFiles.push(file);
 
         const result = await readFiles.execute({ paths: [{ path: file, start: 1, end: 1000 }] });
 
@@ -377,13 +375,11 @@ describe('readFiles', () => {
     });
 
     it('should report correct total bytes when under the limit', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const file1 = path.join(tmpDir, 'file1.txt');
-        const file2 = path.join(tmpDir, 'file2.txt');
+        const file1 = tmpPath('file1.txt');
+        const file2 = tmpPath('file2.txt');
 
         await writeFile(file1, 'A'.repeat(5 * 1024));
         await writeFile(file2, 'B'.repeat(3 * 1024));
-        testFiles.push(file1, file2);
 
         const result = await readFiles.execute({ paths: [{ path: file1 }, { path: file2 }] });
 
@@ -393,11 +389,9 @@ describe('readFiles', () => {
     });
 
     it('should report accurate unreadBytes for truncated files', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const largeFile = path.join(tmpDir, 'large.txt');
+        const largeFile = tmpPath('large.txt');
         const content = 'x'.repeat(30 * 1024);
         await writeFile(largeFile, content);
-        testFiles.push(largeFile);
 
         const result = await readFiles.execute({ paths: [{ path: largeFile }] });
 
@@ -406,13 +400,11 @@ describe('readFiles', () => {
     });
 
     it('should report file size for files read after limit is reached', async () => {
-        const tmpDir = await mkdtemp(path.join(tmpdir(), 'readfiles-test-'));
-        const smallFile = path.join(tmpDir, 'small.txt');
-        const largeFile = path.join(tmpDir, 'large.txt');
+        const smallFile = tmpPath('small.txt');
+        const largeFile = tmpPath('large.txt');
 
         await writeFile(smallFile, 'A'.repeat(1024));
         await writeFile(largeFile, 'B'.repeat(25 * 1024));
-        testFiles.push(smallFile, largeFile);
 
         const result = await readFiles.execute({ paths: [{ path: smallFile }, { path: largeFile }] });
 

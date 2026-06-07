@@ -61,7 +61,7 @@ describe('writeToFile', () => {
         const result = await writeToFile.execute({ path: '/nonexistent/path/file.txt', content: 'test' });
 
         expect(result.success).toBe(false);
-        expect(result.message).toContain('Error writing');
+        expect(result.message).toContain('resolves outside');
     });
 
     it('should default to overwrite mode', async () => {

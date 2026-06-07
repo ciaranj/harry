@@ -2,6 +2,7 @@ import { readFile, stat as fsStat } from 'node:fs/promises';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { resolveCanonicalPath } from './shared.js';
 
 interface ReadFileLineRange {
   path: string;
@@ -55,18 +56,33 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
     if (paths.length === 0) return [];
 
     const results: FileReadResult[] = [];
-    // Cache per-path content to avoid re-reading the same file multiple times
+    // Cache per-canonical-path content to avoid re-reading the same file multiple times
     const cache = new Map<string, string>();
     let totalBytesRead = 0;
     let limitReached = false;
 
     for (const entry of paths) {
+      // Canonicalize the path so symlinks are resolved and we can validate
+      // the file lives inside the working directory.
+      const { canonical, withinBounds } = resolveCanonicalPath(entry.path);
+      if (!withinBounds) {
+        results.push({
+          path: entry.path,
+          success: false,
+          content: undefined,
+          error: `Path "${entry.path}" resolves outside the working directory (${canonical})`,
+          truncated: false,
+          unreadBytes: 0,
+        });
+        continue;
+      }
+
       // Once limit is reached, all subsequent files are truncated (no content)
       if (limitReached) {
         // Try to get file size for unread byte report
         let fileStatSize = 0;
         try {
-          fileStatSize = (await fsStat(entry.path)).size ?? 0;
+          fileStatSize = (await fsStat(canonical)).size ?? 0;
         } catch { /* file may have been deleted */ }
         results.push({
           path: entry.path,
@@ -82,14 +98,14 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
       if (entry.start === undefined || entry.end === undefined) {
         // Full file read
         try {
-          let content = cache.get(entry.path);
+          let content = cache.get(canonical);
           if (content === undefined) {
-            content = await readFile(entry.path, 'utf-8');
+            content = await readFile(canonical, 'utf-8');
             // Strip UTF-8 BOM (U+FEFF) if present
             if (content.startsWith('\uFEFF')) {
               content = content.slice(1);
             }
-            cache.set(entry.path, content);
+            cache.set(canonical, content);
           }
           const byteLen = Buffer.byteLength(content, 'utf-8');
           const truncated = totalBytesRead + byteLen > MAX_BYTES;
@@ -124,23 +140,23 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
         }
       } else {
         // Line-range read
-        const { path: p, start, end } = entry;
+        const { start, end } = entry;
         try {
-          let content = cache.get(p);
+          let content = cache.get(canonical);
           if (content === undefined) {
-            content = await readFile(p, 'utf-8');
+            content = await readFile(canonical, 'utf-8');
             // Strip UTF-8 BOM (U+FEFF) if present
             if (content.startsWith('\uFEFF')) {
               content = content.slice(1);
             }
-            cache.set(p, content);
+            cache.set(canonical, content);
           }
           const allLines = content.split('\n');
           const s = Math.max(1, start);
           const e = Math.min(allLines.length, end);
           if (s > e || s > allLines.length) {
             results.push({
-              path: p,
+              path: entry.path,
               success: false,
               content: undefined,
               error: `Line range ${start}-${end} is out of bounds for file with ${allLines.length} lines`,
@@ -161,7 +177,7 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
           const excerptSlice = truncated ? excerptBytes.slice(0, actualBytes).toString('utf-8') : excerpt;
 
           results.push({
-            path: p,
+            path: entry.path,
             success: true,
             content: excerptSlice,
             error: undefined,
@@ -173,7 +189,7 @@ export const readFiles: Tool<ReadFilesArgs, FileReadResult[]> = {
           if (truncated) limitReached = true;
         } catch (error: any) {
           results.push({
-            path: p,
+            path: entry.path,
             success: false,
             content: undefined,
             error: error.message,

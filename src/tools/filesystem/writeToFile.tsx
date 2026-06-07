@@ -3,6 +3,7 @@ import path from 'node:path';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { resolveCanonicalPath } from './shared.js';
 
 interface WriteToFileArgs {
   path: string;
@@ -36,15 +37,22 @@ export const writeToFile: Tool<WriteToFileArgs, WriteToFileResult> = {
     required: ["path", "content"]
   } as const,
   execute: async ({ path: p, content, mode = 'overwrite' }: WriteToFileArgs, _ctx?: ToolCallContext): Promise<WriteToFileResult> => {
+    // Canonicalize the path so symlinks are resolved and we can validate
+    // the file lives inside the working directory.
+    const { canonical, withinBounds } = resolveCanonicalPath(p);
+    if (!withinBounds) {
+      return { success: false, message: `Path "${p}" resolves outside the working directory (${canonical})` };
+    }
+
     try {
       // Ensure parent directory exists before writing
-      await ensureParentDir(p);
+      await ensureParentDir(canonical);
 
       if (mode === 'append') {
-        await appendFile(p, content, 'utf-8');
+        await appendFile(canonical, content, 'utf-8');
         return { success: true, message: `Successfully appended to ${p}` };
       }
-      await writeFile(p, content, 'utf-8');
+      await writeFile(canonical, content, 'utf-8');
       return { success: true, message: `Successfully wrote to ${p}` };
     } catch (error: any) {
       return { success: false, message: `Error writing to file at "${p}": ${error.message}` };

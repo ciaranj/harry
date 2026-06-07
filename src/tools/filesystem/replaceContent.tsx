@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import React from 'react';
 import { Text } from 'ink';
 import { Tool, ToolCallContext } from '../types.js';
+import { resolveCanonicalPath } from './shared.js';
 
 interface ReplaceContentArgs {
   path: string;
@@ -43,13 +44,20 @@ export const replaceContent: Tool<ReplaceContentArgs, ReplaceResult> = {
       return { success: false, message: `Missing required argument(s): ${missing.join(', ')}` };
     }
 
+    // Canonicalize the path so symlinks are resolved and we can validate
+    // the file lives inside the working directory.
+    const { canonical, withinBounds } = resolveCanonicalPath(p);
+    if (!withinBounds) {
+      return { success: false, message: `Path "${p}" resolves outside the working directory (${canonical})` };
+    }
+
     // Guard: empty search_string with regex matches every position → exponential output.
     if (use_regex && search_string === '') {
       return { success: false, message: `Empty search string is not valid for regex mode.` };
     }
 
     try {
-      const content = await readFile(p, 'utf-8');
+      const content = await readFile(canonical, 'utf-8');
 
       let newContent: string;
       let count: number;
@@ -101,7 +109,7 @@ export const replaceContent: Tool<ReplaceContentArgs, ReplaceResult> = {
         };
       }
 
-      await writeFile(p, newContent, 'utf-8');
+      await writeFile(canonical, newContent, 'utf-8');
 
       return {
         success: true,
