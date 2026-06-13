@@ -25,12 +25,19 @@ export interface CompactionResult {
     contextMdPath?: string;
 }
 
+export type CompactionPhase = 'start' | 'compressing' | 'complete';
+
+export type CompactionProgressCallback = (phase: CompactionPhase, pct?: number) => void;
+
 export interface CompactionStrategy {
+    onProgress?: CompactionProgressCallback;  // optional, for UI feedback
     shouldTrigger(store: SessionStore): boolean;
     doCompaction(store: SessionStore): Promise<CompactionResult>;
 }
 
 export class NoOpCompactionStrategy implements CompactionStrategy {
+    onProgress?: CompactionProgressCallback;
+
     shouldTrigger(_store: SessionStore): boolean {
         return false;
     }
@@ -42,14 +49,16 @@ export class NoOpCompactionStrategy implements CompactionStrategy {
 
 export class RunningMemoryStrategy implements CompactionStrategy {
     private config: Required<CompactionConfig>;
+    onProgress?: CompactionProgressCallback;
 
-    constructor(config?: CompactionConfig) {
+    constructor(config?: CompactionConfig & { onProgress?: CompactionProgressCallback }) {
         this.config = {
             threshold: config?.threshold ?? appConfig.getFloat('AUTO_COMPACTION_THRESHOLD', 0.8),
             recentTurns: config?.recentTurns ?? 5,
             maxToolOutputSize: config?.maxToolOutputSize ?? 2000,
             maxContextSize: config?.maxContextSize ?? appConfig.getInt('MAX_CONTEXT_SIZE', 262144),
         };
+        this.onProgress = config?.onProgress;
     }
 
     shouldTrigger(store: SessionStore): boolean {
@@ -65,6 +74,8 @@ export class RunningMemoryStrategy implements CompactionStrategy {
         if (messages.length <= this.config.recentTurns * 4) {
             return {};
         }
+
+        this.onProgress?.('start');
 
         const outputsDir = store.compactedToolOutputsDirPath();
         if (!fs.existsSync(outputsDir)) {
@@ -145,6 +156,8 @@ export class RunningMemoryStrategy implements CompactionStrategy {
 
         // Mutate the store directly — the store notifies its subscribers
         store.updateMessages(() => newMessages);
+
+        this.onProgress?.('complete', 100);
 
         return { contextMdPath: outputsDir };
     }

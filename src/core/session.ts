@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { randomBytes } from 'node:crypto';
-import { Message } from './types.js';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { Event, Message } from './types.js';
 
 /** Generate a session ID as ISO timestamp + random hex + PID.
  *  Random component prevents collision when the process restarts
@@ -30,6 +30,7 @@ export type Session = {
     updatedAt: string;
     version: number;
     messages: Message[];
+    events?: Event[];      // UI-only events, not sent to LLM
     stats?: SessionStats;
 };
 
@@ -326,6 +327,35 @@ export class SessionStore {
         this.notifyListeners();
     }
 
+    /** Append a UI event (not part of LLM context). Notifies listeners. */
+    appendEvent(type: Event['type'], content: string, metadata?: Record<string, unknown>): void {
+        const event: Event = {
+            id: randomUUID(),
+            type,
+            content,
+            metadata,
+        };
+        this.current.events = [...(this.current.events ?? []), event];
+        this.current.updatedAt = new Date().toISOString();
+        this.notifyListeners();
+    }
+
+    /** Replace the last event (for realtime updates like progress %). Notifies listeners. */
+    updateLastEvent(updater: (prev: Event) => Partial<Event>): void {
+        const events = this.current.events ?? [];
+        if (events.length === 0) return;
+        const last = events[events.length - 1];
+        const updated = { ...last, ...updater(last) } as Event;
+        this.current.events = [...events.slice(0, -1), updated];
+        this.current.updatedAt = new Date().toISOString();
+        this.notifyListeners();
+    }
+
+    /** Get events for the live area. */
+    getEvents(): Event[] {
+        return [...(this.current.events ?? [])];
+    }
+
     /** Persist the current session to disk. */
     async persist(): Promise<void> {
         await saveSession(this.current, this.directory);
@@ -339,7 +369,7 @@ export class SessionStore {
         const newSession = await resetSession(this.directory);
         this.current = newSession;
         this.sessionDir = sessionDirPath(newSession.id, this.directory);
-        this.notifyListeners();
+        this.appendEvent('reset', 'Session reset');
         return newSession;
     }
 

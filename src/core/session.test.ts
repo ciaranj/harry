@@ -169,3 +169,115 @@ describe('SessionStore.resolveConflict', () => {
         expect(result).toHaveLength(2);
     });
 });
+
+// ---------------------------------------------------------------------------
+// SessionStore events — appendEvent, updateLastEvent, getEvents
+// ---------------------------------------------------------------------------
+
+describe('SessionStore events', () => {
+    it('appendEvent adds an event and notifies listeners', () => {
+        const store = makeStore();
+        let notified = false;
+        const unsub = store.subscribe(() => { notified = true; unsub(); });
+
+        store.appendEvent('reset', 'Session reset');
+
+        expect(notified).toBe(true);
+        expect(store.getEvents()).toHaveLength(1);
+        expect(store.getEvents()[0].type).toBe('reset');
+        expect(store.getEvents()[0].content).toBe('Session reset');
+    });
+
+    it('appendEvent stores metadata when provided', () => {
+        const store = makeStore();
+        store.appendEvent('compaction_progress', 'Compacting…', { pct: 50 });
+        const events = store.getEvents();
+        expect(events).toHaveLength(1);
+        expect(events[0].type).toBe('compaction_progress');
+        expect(events[0].metadata).toEqual({ pct: 50 });
+    });
+
+    it('appendEvent generates unique UUIDs', () => {
+        const store = makeStore();
+        store.appendEvent('reset', 'Reset 1');
+        store.appendEvent('compaction_start', 'Compact');
+        const events = store.getEvents();
+        expect(events[0].id).not.toBe(events[1].id);
+    });
+
+    it('getEvents returns empty array when no events', () => {
+        const store = makeStore();
+        expect(store.getEvents()).toHaveLength(0);
+    });
+
+    it('getEvents returns empty for sessions without events field', () => {
+        const session = createSession();
+        session.events = undefined;
+        const store = new SessionStore(session);
+        expect(store.getEvents()).toHaveLength(0);
+    });
+
+    it('updateLastEvent replaces the last event', () => {
+        const store = makeStore();
+        store.appendEvent('compaction_start', 'Compacting…');
+        store.updateLastEvent(() => ({
+            type: 'compaction_complete',
+            content: 'Done',
+        }));
+        const events = store.getEvents();
+        expect(events).toHaveLength(1);
+        expect(events[0].type).toBe('compaction_complete');
+        expect(events[0].content).toBe('Done');
+    });
+
+    it('updateLastEvent with partial update preserves other fields', () => {
+        const store = makeStore();
+        store.appendEvent('compaction_progress', 'Compacting…', { pct: 50 });
+        store.updateLastEvent(() => ({ content: 'Still going…' }));
+        const events = store.getEvents();
+        expect(events[0].content).toBe('Still going…');
+        expect(events[0].type).toBe('compaction_progress');
+        expect(events[0].metadata).toEqual({ pct: 50 });
+    });
+
+    it('updateLastEvent does nothing when no events exist', () => {
+        const store = makeStore();
+        store.updateLastEvent(() => ({ content: 'nope' }));
+        expect(store.getEvents()).toHaveLength(0);
+    });
+
+    it('updateLastEvent notifies listeners', () => {
+        const store = makeStore();
+        store.appendEvent('compaction_start', 'Start');
+        let notified = false;
+        const unsub = store.subscribe(() => { notified = true; unsub(); });
+
+        store.updateLastEvent(() => ({ content: 'Updated' }));
+
+        expect(notified).toBe(true);
+        expect(store.getEvents()[0].content).toBe('Updated');
+    });
+
+    it('multiple appends then updates keeps correct event list', () => {
+        const store = makeStore();
+        store.appendEvent('reset', 'Reset');
+        store.appendEvent('compaction_start', 'Start');
+        store.appendEvent('compaction_progress', 'Progress', { pct: 30 });
+        store.updateLastEvent(() => ({ content: '75%' }));
+
+        const events = store.getEvents();
+        expect(events).toHaveLength(3);
+        expect(events[0].type).toBe('reset');
+        expect(events[1].type).toBe('compaction_start');
+        expect(events[2].type).toBe('compaction_progress');
+        expect(events[2].content).toBe('75%');
+    });
+
+    it('events are included in getSnapshot', () => {
+        const store = makeStore();
+        store.appendEvent('reset', 'Reset');
+        const snapshot = store.getSnapshot();
+        expect(snapshot.events).toHaveLength(1);
+        expect(snapshot.events![0].type).toBe('reset');
+    });
+});

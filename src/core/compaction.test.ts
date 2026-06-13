@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { NoOpCompactionStrategy, RunningMemoryStrategy } from './compaction.js';
+import { NoOpCompactionStrategy, RunningMemoryStrategy, CompactionProgressCallback } from './compaction.js';
 import { Message, createMessage } from './types.js';
 import { SessionStore } from './session.js';
 import { createSession } from './session.js';
@@ -244,5 +244,90 @@ describe('RunningMemoryStrategy', () => {
         const store = new SessionStore(session);
         // undefined contextSize should not trigger
         expect(strategy.shouldTrigger(store)).toBe(false);
+    });
+
+    // -----------------------------------------------------------------------
+    // onProgress callback
+    // -----------------------------------------------------------------------
+
+    it('emits start phase before processing', async () => {
+        const phases: string[] = [];
+        const strategy = new RunningMemoryStrategy({
+            recentTurns: 0,
+            maxToolOutputSize: 10,
+            maxContextSize: 102400,
+            onProgress: (phase, pct) => phases.push(phase),
+        });
+
+        const store = makeStoreWithMessages([
+            makeMsg('tool', 'x'.repeat(20), undefined, 'tc-1'),
+            makeMsg('tool', 'y'.repeat(20), undefined, 'tc-2'),
+        ]);
+
+        await strategy.doCompaction(store);
+        expect(phases).toContain('start');
+    });
+
+    it('emits complete phase after processing', async () => {
+        const phases: (string | undefined)[] = [];
+        const strategy = new RunningMemoryStrategy({
+            recentTurns: 0,
+            maxToolOutputSize: 10,
+            maxContextSize: 102400,
+            onProgress: (phase, pct) => phases.push([phase, pct]),
+        });
+
+        const store = makeStoreWithMessages([
+            makeMsg('tool', 'x'.repeat(20), undefined, 'tc-1'),
+            makeMsg('tool', 'y'.repeat(20), undefined, 'tc-2'),
+        ]);
+
+        await strategy.doCompaction(store);
+        const completePhase = phases.find(([p]) => p === 'complete');
+        expect(completePhase).toBeDefined();
+        expect(completePhase![1]).toBe(100);
+    });
+
+    it('calls onProgress in correct order', async () => {
+        const order: string[] = [];
+        const strategy = new RunningMemoryStrategy({
+            recentTurns: 0,
+            maxToolOutputSize: 10,
+            maxContextSize: 102400,
+            onProgress: (phase) => order.push(phase),
+        });
+
+        const store = makeStoreWithMessages([
+            makeMsg('tool', 'large output here', undefined, 'tc-1'),
+        ]);
+
+        await strategy.doCompaction(store);
+        expect(order).toEqual(['start', 'complete']);
+    });
+
+    it('does not emit phases when threshold not met (early return)', async () => {
+        const phases: string[] = [];
+        const strategy = new RunningMemoryStrategy({
+            recentTurns: 6,
+            maxContextSize: 102400,
+            onProgress: (phase) => phases.push(phase),
+        });
+
+        const store = makeStoreWithMessages([makeMsg('user', 'hi'), makeMsg('assistant', 'hello')]);
+        await strategy.doCompaction(store);
+        expect(phases).toEqual([]);
+    });
+
+    it('noProgress callback is optional', async () => {
+        const strategy = new RunningMemoryStrategy({
+            recentTurns: 0,
+            maxToolOutputSize: 10,
+            maxContextSize: 102400,
+        });
+
+        const store = makeStoreWithMessages([makeMsg('tool', 'x'.repeat(20), undefined, 'tc-1')]);
+        await strategy.doCompaction(store);
+        // Should not throw
+        expect(store.getMessages()).toBeDefined();
     });
 });

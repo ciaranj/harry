@@ -24,7 +24,7 @@ import MarkedTerminalRenderer, { markedTerminal } from 'marked-terminal';
     // renderer can later convert it for ordered lists.
     return '\n* ' + body.replace(/\n+$/, '');
 };
-import { Message, Stats } from '../core/types.js';
+import { Event, Message, Stats } from '../core/types.js';
 import { SessionStore } from '../core/session.js';
 import type pino from 'pino';
 import { CompactionStrategy, RunningMemoryStrategy } from '../core/compaction.js';
@@ -245,6 +245,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
     const [isProcessing, setIsProcessing] = useState(false);
     const [stats, setStats] = useState<Stats>({ tokens: 0, tps: 0, status: 'idle', contextSize: store.getSnapshot().stats?.contextSize ?? 0, cachedContextSize: 0 });
     const [notification, setNotification] = useState<string | null>(null);
+    const [events, setEvents] = useState<Event[]>([]);
     const { exit } = useApp();
     const [tools] = useState(defaultTools);
     const [isConfirmingCancel, setIsConfirmingCancel] = useState(false);
@@ -252,7 +253,31 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
     const abortControllerRef = useRef<AbortController | null>(null);
     const suppressNextInputChange = useRef(false);
     const { isEditing, textInputKey } = useEditorInput({ input, setInput, setNotification, isProcessing, suppressNextInputChange });
-    const compactionStrategy = useMemo(() => new RunningMemoryStrategy(), []);
+    const compactionStrategy = useMemo(() => {
+        const strategy = new RunningMemoryStrategy({
+            onProgress: (phase, pct) => {
+                if (phase === 'start') {
+                    store.appendEvent('compaction_start', 'Compacting…');
+                    setEvents(store.getEvents());
+                } else if (phase === 'complete') {
+                    // Completion event is set by the /compact handler below.
+                    // For auto-compaction from the LLM loop, just update the event.
+                    store.updateLastEvent(() => ({
+                        type: 'compaction_complete',
+                        content: 'Compaction complete',
+                    }));
+                    setEvents(store.getEvents());
+                } else if (phase === 'compressing') {
+                    store.updateLastEvent(() => ({
+                        content: 'Compacting…',
+                        metadata: { pct },
+                    }));
+                    setEvents(store.getEvents());
+                }
+            },
+        });
+        return strategy;
+    }, []);
     const { stdout } = useStdout();
 
     // Safety net: if the process exits while in the alt buffer, restore the
@@ -282,7 +307,10 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
 
     // Subscribe to store changes
     useEffect(() => {
-        const unsub = store.subscribe(() => setMessages(store.getMessages()));
+        const unsub = store.subscribe(() => {
+            setMessages(store.getMessages());
+            setEvents(store.getEvents());
+        });
         return unsub;
     }, [store]);
 
@@ -389,10 +417,11 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
         if (value === '/exit') { exit(); return; }
 
         if (value === '/reset') {
+            // Clear the terminal for a clean visual break between sessions.
+            stdout.write('\x1b[2J\x1b[H');
             await store.reset();
             setMessages(store.getMessages());
-            // The pre-reset history stays visible in scrollback. Clear our
-            // committed cache so future messages start a fresh visual block.
+            setEvents(store.getEvents());
             setCommittedMessages([]);
             setIsProcessing(false);
             setStats({ tokens: 0, tps: 0, status: 'idle', contextSize: 0, cachedContextSize: 0 });
@@ -400,17 +429,36 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
             return;
         }
 
-        if (value === '/compact') {
+       if (value === '/compact') {
             const preCompactMessageLength = store.getMessages().length;
+
+            // Reassign onProgress so it appends the start event (auto-compaction
+            // relies on this too, but here we ensure a fresh callback fires).
+            compactionStrategy.onProgress = (phase, pct) => {
+                if (phase === 'start') {
+                    store.appendEvent('compaction_start', 'Compacting…');
+                    setEvents(store.getEvents());
+                } else if (phase === 'complete') {
+                    const postLen = store.getMessages().length;
+                    store.updateLastEvent(() => ({
+                        type: 'compaction_complete',
+                        content: `Compacted: ${preCompactMessageLength} → ${postLen} messages`,
+                        metadata: result?.contextMdPath ? { contextMdPath: result.contextMdPath } : undefined,
+                    }));
+                    setEvents(store.getEvents());
+                }
+            };
+
             const result = await compactionStrategy.doCompaction(store);
-            const postCompactMessageLength = store.getMessages().length;
+
             // After compaction the store holds new summary messages with new IDs.
             // The pre-compaction history is already in the terminal's scrollback;
             // treat the post-compaction set as already-committed so the new
             // summary messages don't appear as if they were a fresh turn.
             setCommittedMessages(store.getMessages());
-            let msg = `Compacted: ${preCompactMessageLength} → ${postCompactMessageLength} messages`;
-            if (result.contextMdPath) {
+
+            let msg = `Compacted: ${preCompactMessageLength} → ${store.getMessages().length} messages`;
+            if (result?.contextMdPath) {
                 msg += ` | wrote ${result.contextMdPath}`;
             }
             setNotification(msg);
@@ -487,6 +535,28 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 No paddingX here — MessageView already provides 1 col, and
                 stacking would offset streaming messages relative to Static. */}
             <Box flexDirection="column">
+                {/* UI events: reset, compaction progress, etc. */}
+                {events.length > 0 && (
+                    <Box flexDirection="column" marginBottom={1}>
+                        {events.map(ev => (
+                            ev.type === 'reset' ? (
+                                <Box key={ev.id} paddingX={1}>
+                                    <Text color={theme.reset} bold>
+                                        {'─'.repeat(20)} SESSION RESET {'─'.repeat(20)}
+                                    </Text>
+                                </Box>
+                            ) : (
+                                <Box key={ev.id} paddingX={1}>
+                                    <Text color={theme.event} dimColor>
+                                        {theme.glyph.event} {ev.content}
+                                        {ev.metadata?.pct ? ` ${ev.metadata.pct}%` : ''}
+                                    </Text>
+                                </Box>
+                            )
+                        ))}
+                    </Box>
+                )}
+
                 {liveMessages.map((msg) => (
                     <React.Fragment key={msg.id}>
                         {liveReasoning.msgId === msg.id && liveReasoning.text && (

@@ -26,6 +26,14 @@ export type Message = {
     tool_call_id?: string;
 };
 
+/** UI-only event: non-LLM state changes visible to the user. */
+export type Event = {
+    id: string;
+    type: 'reset' | 'compaction_start' | 'compaction_progress' | 'compaction_complete';
+    content?: string;
+    metadata?: Record<string, unknown>;
+};
+
 export type Stats = {
     tokens: number;
     tps: number;
