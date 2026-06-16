@@ -269,16 +269,21 @@ async function streamOneTurn(
     setStats: React.Dispatch<React.SetStateAction<Stats>>,
     store: SessionStore,
     logger: pino.Logger,
-    retryOpts: RetryOpts
-): Promise<StreamOneTurnResult> {
+    retryOpts: RetryOpts,
+ ): Promise<StreamOneTurnResult> {
     const { maxRetries, baseDelayMs, jitterFactor } = retryOpts;
     const tokenCount = { value: 0 };
     const toolCalls: ToolCallAccumulator[] = [];
     let finishReason: string | undefined;
 
-    const stats: Stats = { tokens: 0, tps: 0, status: 'sending', contextSize: 0, cachedContextSize: 0 };
+    // Read the previous context size from the store so the gauge doesn't
+    // flash zero between turns or across makeCallToLLM invocations.
+    const prevContextSize = store.getSnapshot().stats?.contextSize ?? 0;
+    const prevCachedContextSize = store.getSnapshot().stats?.cachedContextSize ?? 0;
+
+    const stats: Stats = { tokens: 0, tps: 0, status: 'sending', contextSize: prevContextSize, cachedContextSize: prevCachedContextSize };
     setStats(() => ({ ...stats }));
-    store.setStats({ contextSize: 0 });
+    store.setStats({ contextSize: prevContextSize, cachedContextSize: prevCachedContextSize });
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (signal?.aborted) throw new Error("Aborted");

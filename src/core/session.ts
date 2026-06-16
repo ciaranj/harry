@@ -22,6 +22,7 @@ function generateSessionId(): string {
 
 export type SessionStats = {
     contextSize: number;
+    cachedContextSize: number;
 };
 
 export type Session = {
