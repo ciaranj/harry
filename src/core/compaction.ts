@@ -70,12 +70,19 @@ export class RunningMemoryStrategy implements CompactionStrategy {
  
 
     async doCompaction(store: SessionStore): Promise<CompactionResult> {
-        const messages = store.getMessages();
-        if (messages.length <= this.config.recentTurns * 4) {
+        // Gate on real (non-event) messages — inline UI events shouldn't tip
+        // the decision to compact.
+        const realCount = store.getMessages().filter(m => m.role !== 'event').length;
+        if (realCount <= this.config.recentTurns * 4) {
             return {};
         }
 
+        // Emit the start event first so it's appended as the last message, then
+        // re-read so we operate on a snapshot that includes it. This keeps the
+        // start event from being clobbered by the updateMessages() call below,
+        // and lets onProgress('complete') patch it in place afterwards.
         this.onProgress?.('start');
+        const messages = store.getMessages();
 
         const outputsDir = store.compactedToolOutputsDirPath();
         if (!fs.existsSync(outputsDir)) {
@@ -100,9 +107,14 @@ export class RunningMemoryStrategy implements CompactionStrategy {
 
         // Compress older messages: drop reasoning, externalize large tool outputs
         const compressed: Message[] = [];
+        // Earlier inline events (resets, prior compaction markers) that fall in
+        // the compressed range are collapsed into a single marker (see below).
+        let collapsedEvent = false;
 
         for (const msg of olderMessages) {
-            if (msg.role === 'user') {
+            if (msg.role === 'event') {
+                collapsedEvent = true;
+            } else if (msg.role === 'user') {
                 compressed.push(msg);
             } else if (msg.role === 'assistant') {
                 const cleanMsg: Message = {
@@ -149,6 +161,18 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                     compressed.push(msg);
                 }
             }
+        }
+
+        // If any earlier events were swallowed by compaction, leave a single
+        // marker at the compaction boundary so the timeline still reflects that
+        // history was collapsed here.
+        if (collapsedEvent) {
+            compressed.push({
+                id: randomUUID(),
+                role: 'event',
+                event: 'history_compacted',
+                content: 'Earlier history compacted',
+            });
         }
 
         // Combine: compressed older + recent uncompressed (full fidelity)

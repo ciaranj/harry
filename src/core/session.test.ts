@@ -175,7 +175,7 @@ describe('SessionStore.resolveConflict', () => {
 // ---------------------------------------------------------------------------
 
 describe('SessionStore events', () => {
-    it('appendEvent adds an event and notifies listeners', () => {
+    it('appendEvent adds an inline event message and notifies listeners', () => {
         const store = makeStore();
         let notified = false;
         const unsub = store.subscribe(() => { notified = true; unsub(); });
@@ -184,8 +184,11 @@ describe('SessionStore events', () => {
 
         expect(notified).toBe(true);
         expect(store.getEvents()).toHaveLength(1);
-        expect(store.getEvents()[0].type).toBe('reset');
+        expect(store.getEvents()[0].event).toBe('reset');
         expect(store.getEvents()[0].content).toBe('Session reset');
+        // Lives in the message stream, with role 'event'.
+        expect(store.getMessages()).toHaveLength(1);
+        expect(store.getMessages()[0].role).toBe('event');
     });
 
     it('appendEvent stores metadata when provided', () => {
@@ -193,7 +196,7 @@ describe('SessionStore events', () => {
         store.appendEvent('compaction_progress', 'Compacting…', { pct: 50 });
         const events = store.getEvents();
         expect(events).toHaveLength(1);
-        expect(events[0].type).toBe('compaction_progress');
+        expect(events[0].event).toBe('compaction_progress');
         expect(events[0].metadata).toEqual({ pct: 50 });
     });
 
@@ -205,15 +208,20 @@ describe('SessionStore events', () => {
         expect(events[0].id).not.toBe(events[1].id);
     });
 
-    it('getEvents returns empty array when no events', () => {
+    it('appendEvent does not disturb existing non-event messages', () => {
         const store = makeStore();
-        expect(store.getEvents()).toHaveLength(0);
+        store.updateMessages(() => [createMessage({ role: 'user', content: 'hi' })]);
+        store.appendEvent('reset', 'Session reset');
+        const msgs = store.getMessages();
+        expect(msgs).toHaveLength(2);
+        expect(msgs[0].role).toBe('user');
+        expect(msgs[1].role).toBe('event');
+        // getEvents only surfaces the event messages.
+        expect(store.getEvents()).toHaveLength(1);
     });
 
-    it('getEvents returns empty for sessions without events field', () => {
-        const session = createSession();
-        session.events = undefined;
-        const store = new SessionStore(session);
+    it('getEvents returns empty array when no events', () => {
+        const store = makeStore();
         expect(store.getEvents()).toHaveLength(0);
     });
 
@@ -221,12 +229,12 @@ describe('SessionStore events', () => {
         const store = makeStore();
         store.appendEvent('compaction_start', 'Compacting…');
         store.updateLastEvent(() => ({
-            type: 'compaction_complete',
+            event: 'compaction_complete',
             content: 'Done',
         }));
         const events = store.getEvents();
         expect(events).toHaveLength(1);
-        expect(events[0].type).toBe('compaction_complete');
+        expect(events[0].event).toBe('compaction_complete');
         expect(events[0].content).toBe('Done');
     });
 
@@ -236,8 +244,20 @@ describe('SessionStore events', () => {
         store.updateLastEvent(() => ({ content: 'Still going…' }));
         const events = store.getEvents();
         expect(events[0].content).toBe('Still going…');
-        expect(events[0].type).toBe('compaction_progress');
+        expect(events[0].event).toBe('compaction_progress');
         expect(events[0].metadata).toEqual({ pct: 50 });
+    });
+
+    it('updateLastEvent patches the last event even when a later non-event message follows', () => {
+        const store = makeStore();
+        store.appendEvent('compaction_start', 'Compacting…');
+        store.updateMessages(msgs => [...msgs, createMessage({ role: 'assistant', content: 'done' })]);
+        store.updateLastEvent(() => ({ event: 'compaction_complete', content: 'Done' }));
+        const events = store.getEvents();
+        expect(events).toHaveLength(1);
+        expect(events[0].event).toBe('compaction_complete');
+        // The trailing assistant message is untouched.
+        expect(store.getMessages().at(-1)?.role).toBe('assistant');
     });
 
     it('updateLastEvent does nothing when no events exist', () => {
@@ -267,17 +287,18 @@ describe('SessionStore events', () => {
 
         const events = store.getEvents();
         expect(events).toHaveLength(3);
-        expect(events[0].type).toBe('reset');
-        expect(events[1].type).toBe('compaction_start');
-        expect(events[2].type).toBe('compaction_progress');
+        expect(events[0].event).toBe('reset');
+        expect(events[1].event).toBe('compaction_start');
+        expect(events[2].event).toBe('compaction_progress');
         expect(events[2].content).toBe('75%');
     });
 
-    it('events are included in getSnapshot', () => {
+    it('events are included in getSnapshot messages', () => {
         const store = makeStore();
         store.appendEvent('reset', 'Reset');
         const snapshot = store.getSnapshot();
-        expect(snapshot.events).toHaveLength(1);
-        expect(snapshot.events![0].type).toBe('reset');
+        const eventMsgs = snapshot.messages.filter(m => m.role === 'event');
+        expect(eventMsgs).toHaveLength(1);
+        expect(eventMsgs[0].event).toBe('reset');
     });
 });

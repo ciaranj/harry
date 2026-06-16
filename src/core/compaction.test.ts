@@ -224,6 +224,70 @@ describe('RunningMemoryStrategy', () => {
         expect(userMessages[2].content).toBe('Third question');
     });
 
+    it('collapses earlier inline events in the compressed range into a single marker', async () => {
+        const strategy = new RunningMemoryStrategy({ recentTurns: 1, maxToolOutputSize: 2000, maxContextSize: 102400 });
+        const messages: Message[] = [
+            { id: 'e1', role: 'event', event: 'reset', content: 'Session reset' },
+            makeMsg('user', 'First question'),
+            makeMsg('assistant', 'First answer'),
+            { id: 'e2', role: 'event', event: 'compaction_complete', content: 'Compacted earlier' },
+            makeMsg('user', 'Second question'),
+            makeMsg('assistant', 'Second answer'),
+            makeMsg('user', 'Third question'),
+            makeMsg('assistant', 'Third answer'),
+        ];
+
+        const store = makeStoreWithMessages(messages);
+        await strategy.doCompaction(store);
+
+        const events = store.getMessages().filter(m => m.role === 'event');
+        // Both earlier events collapse into exactly one history_compacted marker.
+        expect(events).toHaveLength(1);
+        expect(events[0].event).toBe('history_compacted');
+        // The recent turn is preserved in full.
+        expect(store.getMessages().some(m => m.content === 'Third answer')).toBe(true);
+    });
+
+    it('leaves no marker when the compressed range contains no events', async () => {
+        const strategy = new RunningMemoryStrategy({ recentTurns: 1, maxToolOutputSize: 2000, maxContextSize: 102400 });
+        const messages: Message[] = [
+            makeMsg('user', 'First question'),
+            makeMsg('assistant', 'First answer'),
+            makeMsg('user', 'Second question'),
+            makeMsg('assistant', 'Second answer'),
+            makeMsg('user', 'Third question'),
+            makeMsg('assistant', 'Third answer'),
+        ];
+        const store = makeStoreWithMessages(messages);
+        await strategy.doCompaction(store);
+        expect(store.getMessages().some(m => m.role === 'event')).toBe(false);
+    });
+
+    it('preserves a start event emitted via onProgress and lets complete patch it in place', async () => {
+        // Mirrors the App wiring: onProgress appends/patches inline events on the store.
+        const strategy = new RunningMemoryStrategy({ recentTurns: 1, maxToolOutputSize: 2000, maxContextSize: 102400 });
+        const messages: Message[] = [
+            makeMsg('user', 'First question'),
+            makeMsg('assistant', 'First answer'),
+            makeMsg('user', 'Second question'),
+            makeMsg('assistant', 'Second answer'),
+            makeMsg('user', 'Third question'),
+            makeMsg('assistant', 'Third answer'),
+        ];
+        const store = makeStoreWithMessages(messages);
+        strategy.onProgress = (phase) => {
+            if (phase === 'start') store.appendEvent('compaction_start', 'Compacting…');
+            else if (phase === 'complete') store.updateLastEvent(() => ({ event: 'compaction_complete', content: 'Done' }));
+        };
+
+        await strategy.doCompaction(store);
+
+        const events = store.getMessages().filter(m => m.role === 'event');
+        expect(events).toHaveLength(1);
+        expect(events[0].event).toBe('compaction_complete');
+        expect(events[0].content).toBe('Done');
+    });
+
     it('doCompaction uses store to resolve compacted outputs path', async () => {
         const strategy = new RunningMemoryStrategy({ recentTurns: 0, maxToolOutputSize: 10, maxContextSize: 102400 });
         const messages: Message[] = [

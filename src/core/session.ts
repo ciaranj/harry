@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { Event, Message } from './types.js';
+import { EventType, Message } from './types.js';
 
 /** Generate a session ID as ISO timestamp + random hex + PID.
  *  Random component prevents collision when the process restarts
@@ -29,8 +29,7 @@ export type Session = {
     createdAt: string;
     updatedAt: string;
     version: number;
-    messages: Message[];
-    events?: Event[];      // UI-only events, not sent to LLM
+    messages: Message[];   // includes inline UI-only events (role: 'event')
     stats?: SessionStats;
 };
 
@@ -74,7 +73,12 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
                 if (stat.mtimeMs <= latestTime) continue;
 
                 const parsed = JSON.parse(data);
-                if (!parsed.messages || parsed.messages.length === 0) continue;
+                // Treat a session with only UI-only events (e.g. a lone reset
+                // marker) as empty so a freshly reset session isn't resumed.
+                const realMessages = Array.isArray(parsed.messages)
+                    ? parsed.messages.filter((m: Message) => m.role !== 'event')
+                    : [];
+                if (realMessages.length === 0) continue;
 
                 latestTime = stat.mtimeMs;
                 latest = sessionId;
@@ -327,33 +331,51 @@ export class SessionStore {
         this.notifyListeners();
     }
 
-    /** Append a UI event (not part of LLM context). Notifies listeners. */
-    appendEvent(type: Event['type'], content: string, metadata?: Record<string, unknown>): void {
-        const event: Event = {
+    /**
+     * Append a UI event as an inline message (role: 'event'). It stays
+     * temporally ordered with the conversation but is filtered out of the LLM
+     * payload (see buildLLMPayload). Notifies listeners.
+     */
+    appendEvent(event: EventType, content: string, metadata?: Record<string, unknown>): void {
+        const msg: Message = {
             id: randomUUID(),
-            type,
+            role: 'event',
+            event,
             content,
             metadata,
         };
-        this.current.events = [...(this.current.events ?? []), event];
-        this.current.updatedAt = new Date().toISOString();
+        this.current = {
+            ...this.current,
+            messages: [...this.current.messages, msg],
+            updatedAt: new Date().toISOString(),
+        };
         this.notifyListeners();
     }
 
-    /** Replace the last event (for realtime updates like progress %). Notifies listeners. */
-    updateLastEvent(updater: (prev: Event) => Partial<Event>): void {
-        const events = this.current.events ?? [];
-        if (events.length === 0) return;
-        const last = events[events.length - 1];
-        const updated = { ...last, ...updater(last) } as Event;
-        this.current.events = [...events.slice(0, -1), updated];
-        this.current.updatedAt = new Date().toISOString();
-        this.notifyListeners();
+    /**
+     * Patch the most recent event message (for realtime updates like progress %).
+     * Searches from the end — the last event message need not be the last message
+     * overall. Notifies listeners.
+     */
+    updateLastEvent(updater: (prev: Message) => Partial<Message>): void {
+        const msgs = this.current.messages;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+            if (msgs[i].role === 'event') {
+                const updated = { ...msgs[i], ...updater(msgs[i]) } as Message;
+                this.current = {
+                    ...this.current,
+                    messages: [...msgs.slice(0, i), updated, ...msgs.slice(i + 1)],
+                    updatedAt: new Date().toISOString(),
+                };
+                this.notifyListeners();
+                return;
+            }
+        }
     }
 
-    /** Get events for the live area. */
-    getEvents(): Event[] {
-        return [...(this.current.events ?? [])];
+    /** Get the inline event messages, in order. */
+    getEvents(): Message[] {
+        return this.current.messages.filter(m => m.role === 'event');
     }
 
     /** Persist the current session to disk. */

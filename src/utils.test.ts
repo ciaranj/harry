@@ -21,4 +21,18 @@ describe('buildLLMPayload', () => {
         expect(payload.stream).toBe(true);
         expect(payload.cache_prompt).toBe(true);
     });
+
+    it('filters out inline event messages so they never reach the LLM', () => {
+        const messages: Message[] = [
+            { id: '1', role: 'user', content: 'hello' },
+            { id: '2', role: 'event', event: 'reset', content: 'Session reset' },
+            { id: '3', role: 'assistant', content: 'hi' },
+            { id: '4', role: 'event', event: 'compaction_complete', content: 'Compacted' },
+        ];
+        const payload = buildLLMPayload(messages, []);
+
+        // system prompt + the two non-event messages, no events.
+        expect(payload.messages.map(m => m.role)).toEqual(['system', 'user', 'assistant']);
+        expect(payload.messages.some(m => m.role === 'event')).toBe(false);
+    });
 });

@@ -1,4 +1,4 @@
-import { Message } from './core/types.js';
+import { Message, isEventMessage } from './core/types.js';
 import { systemPrompt } from './constants.js';
 import { AppConfig } from './core/config/index.js';
 
@@ -20,7 +20,10 @@ export function buildLLMPayload(messages: Message[], tools: any[]): LLMPayload {
         model: config.getString('MODEL'),
         messages: [
             { role: 'system', content: systemPrompt },
-            ...messages
+            // UI-only events (resets, compaction markers) live inline in the
+            // message stream for temporal ordering, but must never be sent to
+            // the model. This is the single chokepoint that strips them.
+            ...messages.filter(m => !isEventMessage(m))
         ],
         tools,
         stream: true,
