@@ -454,6 +454,8 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
        if (value === '/compact') {
             const preCompactMessageLength = store.getMessages().length;
 
+            let result: any;
+
             // Reassign onProgress so it appends the start event (auto-compaction
             // relies on this too, but here we ensure a fresh callback fires).
             compactionStrategy.onProgress = (phase, _pct) => {
@@ -469,7 +471,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                 }
             };
 
-            const result = await compactionStrategy.doCompaction(store);
+            result = await compactionStrategy.doCompaction(store);
 
             // After compaction the store holds new summary messages with new IDs.
             // The pre-compaction history is already in the terminal's scrollback;
