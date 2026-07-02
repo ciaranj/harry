@@ -28,6 +28,8 @@ import { Message, Stats } from '../core/types.js';
 import { SessionStore } from '../core/session.js';
 import type pino from 'pino';
 import { CompactionStrategy, RunningMemoryStrategy } from '../core/compaction.js';
+import { classifyJobOutcome, type JobConfig } from '../core/job.js';
+import type { MakeCallToLLMOptions } from '../core/llm.js';
 import { tools as defaultTools } from '../tools/index.js';
 import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
@@ -241,11 +243,16 @@ interface AppProps {
         compactionStrategy: CompactionStrategy,
         guardrails: GuardrailConfigManager,
         sessionLogger: pino.Logger,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        options?: MakeCallToLLMOptions
     ) => Promise<void>;
     store: SessionStore;
     sessionLogger: pino.Logger;
     guardrails: GuardrailConfigManager;
+    /** When set, Harry runs this job autonomously instead of waiting for input. */
+    job?: JobConfig;
+    /** Called when a job finishes, with its exit code (0 complete, 1 blocked). */
+    onJobEnd?: (code: number) => void;
 }
 
 function useStdoutDimensions(): [number, number] {
@@ -259,7 +266,7 @@ function useStdoutDimensions(): [number, number] {
     return dimensions;
 }
 
-export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProps) => {
+export const App = ({ makeCallToLLM, store, sessionLogger, guardrails, job, onJobEnd }: AppProps) => {
     const initialMessages = store.getMessages();
     const [messages, setMessages] = useState<Message[]>(initialMessages);
     const [committedMessages, setCommittedMessages] = useState<Message[]>(initialMessages);
@@ -272,8 +279,9 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
     const [isConfirmingCancel, setIsConfirmingCancel] = useState(false);
     const [isReviewing, setIsReviewing] = useState(false);
     const abortControllerRef = useRef<AbortController | null>(null);
+    const jobStartedRef = useRef(false);
     const suppressNextInputChange = useRef(false);
-    const { isEditing, textInputKey } = useEditorInput({ input, setInput, setNotification, isProcessing, suppressNextInputChange });
+    const { isEditing, textInputKey } = useEditorInput({ input, setInput, setNotification, isProcessing, suppressNextInputChange, enabled: !job });
     const compactionStrategy = useMemo(() => {
         const strategy = new RunningMemoryStrategy({
             onProgress: (phase, pct) => {
@@ -419,7 +427,7 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
             suppressNextInputChange.current = true;
             return;
         }
-    });
+    }, { isActive: !job });
 
     useEffect(() => {
         const init = async () => {
@@ -527,6 +535,57 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
         }
     };
 
+    // Job mode: on mount, run the job autonomously to completion, then signal
+    // the exit code. Guarded by a ref so React's effect re-runs can't re-launch
+    // an in-flight job.
+    useEffect(() => {
+        if (!job || jobStartedRef.current) return;
+        jobStartedRef.current = true;
+        const activeJob = job;
+
+        const runJob = async () => {
+            setIsProcessing(true);
+            abortControllerRef.current = new AbortController();
+            store.appendEvent('job_start', `Job started: ${activeJob.filePath}`);
+
+            let code = 1;
+            try {
+                await makeCallToLLM(
+                    job.prompt,
+                    tools.length > 0 ? [...tools] : [],
+                    setStats,
+                    store,
+                    compactionStrategy,
+                    guardrails,
+                    sessionLogger,
+                    abortControllerRef.current.signal,
+                    { maxLoops: activeJob.maxLoops, systemPrompt: activeJob.systemPrompt }
+                );
+
+                // Classify the outcome from the final assistant message's sentinel.
+                const msgs = store.getMessages();
+                const finalText = [...msgs].reverse().find(m => m.role === 'assistant' && m.content)?.content ?? '';
+                const outcome = classifyJobOutcome(finalText);
+                code = outcome.code;
+                store.appendEvent(outcome.event, outcome.message);
+            } catch (e) {
+                code = 1;
+                const msg = e instanceof Error ? e.message : String(e);
+                store.appendEvent('job_blocked', `Job failed: ${msg}`);
+                sessionLogger.error({ error: msg }, 'Job run failed');
+            } finally {
+                setIsProcessing(false);
+                abortControllerRef.current = null;
+                try { await store.persist(); } catch { /* best-effort */ }
+                onJobEnd?.(code);
+            }
+        };
+
+        runJob();
+        // job is stable for the lifetime of the process; run exactly once.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [job]);
+
     if (isReviewing) {
         return (
             <ReviewView
@@ -595,31 +654,46 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails }: AppProp
                     </Box>
                 )}
 
-                <Box
-                    paddingX={1}
-                    borderStyle="single"
-                    borderColor={theme.muted}
-                    borderLeft={false}
-                    borderRight={false}
-                >
-                    <Text color={isConfirmingCancel ? theme.danger : theme.inputPrompt} bold>
-                        {isConfirmingCancel
-                            ? (stats.status === 'idle' ? `[LEAVING] ${theme.glyph.prompt} ` : `[CANCELING] ${theme.glyph.prompt} `)
-                            : `${theme.glyph.prompt} `}
-                    </Text>
-                    <TextInput
-                        key={textInputKey}
-                        value={input}
-                        onChange={(val) => {
-                            if (suppressNextInputChange.current || isEditing) {
-                                suppressNextInputChange.current = false;
-                                return;
-                            }
-                            setInput(val);
-                        }}
-                        onSubmit={handleInput}
-                    />
-                </Box>
+                {job ? (
+                    <Box
+                        paddingX={1}
+                        borderStyle="single"
+                        borderColor={theme.accent}
+                        borderLeft={false}
+                        borderRight={false}
+                    >
+                        <Text color={theme.accent} bold>JOB </Text>
+                        <Text color={theme.muted}>
+                            {isProcessing ? 'running autonomously…' : 'finished'} — input disabled
+                        </Text>
+                    </Box>
+                ) : (
+                    <Box
+                        paddingX={1}
+                        borderStyle="single"
+                        borderColor={theme.muted}
+                        borderLeft={false}
+                        borderRight={false}
+                    >
+                        <Text color={isConfirmingCancel ? theme.danger : theme.inputPrompt} bold>
+                            {isConfirmingCancel
+                                ? (stats.status === 'idle' ? `[LEAVING] ${theme.glyph.prompt} ` : `[CANCELING] ${theme.glyph.prompt} `)
+                                : `${theme.glyph.prompt} `}
+                        </Text>
+                        <TextInput
+                            key={textInputKey}
+                            value={input}
+                            onChange={(val) => {
+                                if (suppressNextInputChange.current || isEditing) {
+                                    suppressNextInputChange.current = false;
+                                    return;
+                                }
+                                setInput(val);
+                            }}
+                            onSubmit={handleInput}
+                        />
+                    </Box>
+                )}
 
                 <Box paddingX={1}>
                     <Text color={theme.muted}>

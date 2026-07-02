@@ -7,7 +7,7 @@ import { EventType, Message } from './types.js';
 /** Generate a session ID as ISO timestamp + random hex + PID.
  *  Random component prevents collision when the process restarts
  *  within the same millisecond (e.g. crash recovery). */
-function generateSessionId(): string {
+function generateSessionId(prefix: string = ''): string {
     const now = new Date();
     const y = now.getFullYear();
     const mo = String(now.getMonth() + 1).padStart(2, '0');
@@ -17,8 +17,13 @@ function generateSessionId(): string {
     const s = String(now.getSeconds()).padStart(2, '0');
     const ms = String(now.getMilliseconds()).padStart(3, '0');
     const rand = randomBytes(4).toString('hex');
-    return `${y}-${mo}-${d}T${h}${mi}${s}${ms}-${rand}-${process.pid}`;
+    return `${prefix}${y}-${mo}-${d}T${h}${mi}${s}${ms}-${rand}-${process.pid}`;
 }
+
+/** Prefix marking a session created for an autonomous job run. Such sessions
+ * are isolated: findActiveSessionId skips them so a job never becomes the
+ * session an interactive run resumes. */
+export const JOB_SESSION_PREFIX = 'job-';
 
 export type SessionStats = {
     contextSize: number;
@@ -62,6 +67,8 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
         const entries = fs.readdirSync(sessionsDir);
         for (const entry of entries) {
             const sessionId = entry;
+            // Job sessions are isolated and must never be resumed interactively.
+            if (sessionId.startsWith(JOB_SESSION_PREFIX)) continue;
             const filePath = sessionFilePath(sessionId, cwd);
 
             try {
@@ -96,10 +103,10 @@ export function findActiveSessionId(cwd: string = process.cwd()): string | null 
     return latest || null;
 }
 
-export function createSession(directory: string = process.cwd()): Session {
+export function createSession(directory: string = process.cwd(), idPrefix: string = ''): Session {
     const now = new Date().toISOString();
     return {
-        id: generateSessionId(),
+        id: generateSessionId(idPrefix),
         createdAt: now,
         updatedAt: now,
         version: 0,

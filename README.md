@@ -69,6 +69,45 @@ Once built, you can run the compiled JavaScript:
 npm run start
 ```
 
+## Jobs (autonomous mode)
+
+Harry can run a **Job**: a markdown brief it executes autonomously to completion with no human interaction.
+
+```bash
+node build/index.js -j path/to/job.md      # or --job path/to/job.md
+npm run dev -- -j path/to/job.md           # in dev
+```
+
+In job mode Harry uses a distinct system prompt (no prompts for clarification or approval) and an effectively-unlimited loop cap. It runs until the goal is verified or it determines it cannot finish without a human. It then exits with:
+
+- **0** — the run ended with `JOB_COMPLETE` (goal achieved and verified)
+- **1** — the run ended with `JOB_BLOCKED: <reason>`, errored, or stopped without completing
+- **2** — the job file is missing, empty, or has no `## Goal` section (validation error, before any model call)
+
+### Job file format
+
+A job is plain markdown. The only hard requirement is a `## Goal` heading; the other sections are conventions Harry is told to follow:
+
+```markdown
+## Goal
+What done looks like.
+
+## Verification
+How success is checked (e.g. `npm test` passes, a command outputs X).
+
+## Vision
+Context and intent behind the job.
+
+## Plan
+(optional) High-level approach.
+
+## Tasks
+- [ ] Concrete task one
+- [ ] Concrete task two
+```
+
+See [`examples/jobs/example-job.md`](examples/jobs/example-job.md) for a worked example.
+
 ## Technologies Used
 
 - **TypeScript** - For type-safe development.

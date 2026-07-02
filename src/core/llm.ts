@@ -432,6 +432,8 @@ export interface MakeCallToLLMOptions {
     retryBaseDelayMs?: number;
     /** Maximum jitter factor to spread retry times (0-1, default: 0.25). */
     retryJitterFactor?: number;
+    /** Full system-prompt override replacing the default (e.g. JOB MODE). */
+    systemPrompt?: string;
 }
 
 export async function makeCallToLLM(
@@ -465,7 +467,7 @@ export async function makeCallToLLM(
         message = undefined;
 
         const startTime = process.hrtime.bigint();
-        const body = JSON.stringify(buildLLMPayload(store.getMessages(), toolsToOpenAITools(tools)));
+        const body = JSON.stringify(buildLLMPayload(store.getMessages(), toolsToOpenAITools(tools), options?.systemPrompt));
 
         const { toolCalls, finishReason, stats } = await streamOneTurn(
             body, fetchUrl, timeoutMs, signal, startTime, setStats, store, sessionLogger, retryOpts

@@ -63,6 +63,9 @@ interface UseEditorInputOptions {
     setNotification: (msg: string) => void;
     isProcessing: boolean;
     suppressNextInputChange: MutableRefObject<boolean>;
+    /** When false, the Ctrl-E handler is inactive (e.g. headless job mode,
+        where activating raw mode on a non-TTY stdin would throw). */
+    enabled?: boolean;
 }
 
 export function useEditorInput({
@@ -71,6 +74,7 @@ export function useEditorInput({
     setNotification,
     isProcessing,
     suppressNextInputChange,
+    enabled = true,
 }: UseEditorInputOptions): { isEditing: boolean; textInputKey: number } {
     const [isEditing, setIsEditing] = useState(false);
     const [textInputKey, setTextInputKey] = useState(0);
@@ -103,7 +107,7 @@ export function useEditorInput({
         try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
 
         setIsEditing(false);
-    });
+    }, { isActive: enabled });
 
     return { isEditing, textInputKey };
 }

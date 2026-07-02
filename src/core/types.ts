@@ -30,7 +30,10 @@ export type EventType =
     | 'compaction_start'
     | 'compaction_progress'
     | 'compaction_complete'
-    | 'history_compacted';
+    | 'history_compacted'
+    | 'job_start'
+    | 'job_complete'
+    | 'job_blocked';
 
 export type Message = {
     id: string;

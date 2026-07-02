@@ -46,16 +46,25 @@ export function getLoggerInstance(cwd: string): pino.Logger {
     return _logger;
 }
 
-/** Flush pending log data and close the transport. Call before process exit. */
+/** Flush pending log data and close the transport. Call before process exit.
+ *  Best-effort: never rejects, so callers can rely on it not overriding their
+ *  own exit code. Both pino's and thread-stream's flush are callback-style
+ *  (thread-stream's throws if invoked without a callback), so we promisify
+ *  them rather than awaiting their return value. */
 export async function closeLogger(): Promise<void> {
-    if (_logger) {
-        await _logger.flush();
-        // Flush the underlying stream destination to ensure buffered data is written.
-        if (_transportDest && typeof _transportDest.flush === 'function') {
-            await _transportDest.flush();
+    if (!_logger) return;
+    const logger = _logger;
+    const dest = _transportDest;
+    _logger = null;
+    _transportDest = null;
+    try {
+        await new Promise<void>((resolve) => logger.flush(() => resolve()));
+        if (dest && typeof dest.flush === 'function') {
+            await new Promise<void>((resolve) => dest.flush(() => resolve()));
         }
-        _logger = null;
-        _transportDest = null;
+    } catch {
+        // Logger flush is best-effort; buffered entries may be lost, but a
+        // flush failure must never crash shutdown.
     }
 }
 
