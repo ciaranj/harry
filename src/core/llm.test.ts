@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi, Mock } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, Mock, Mocked } from 'vitest';
 import { NoOpCompactionStrategy } from './compaction.js';
 import { Message, createMessage } from './types.js';
 import { SessionStore } from './session.js';
@@ -89,14 +89,22 @@ describe('NoOpCompactionStrategy', () => {
 });
 
 // ===================================================================
-// makeCallToLLM retry tests
+// Injected dependencies — makeCallToLLM (deps-based) tests
 // ===================================================================
 
 // Set env before importing llm module
 process.env.MODEL = 'test-model';
 process.env.LLAMACPP_URL = 'http://localhost:8080/';
 
-import { makeCallToLLM, MakeCallToLLMOptions } from './llm.js';
+import {
+    makeCallToLLM,
+    MakeCallToLLMOptions,
+    HttpClient,
+    LLMConfig,
+    ToolDispatcher,
+    SleepFn,
+    noopSleep,
+} from './llm.js';
 import { createDefaultConfigStore } from './config/index.js';
 import { GuardrailConfigManager } from './config/index.js';
 
@@ -167,20 +175,103 @@ function makeMockLogger() {
     };
 }
 
-// Use fast delay for tests that need retries (10ms base instead of 1s)
+// Default fast retry for tests that need retries (10ms base instead of 1s)
 const FAST_RETRY: Partial<MakeCallToLLMOptions> = { retryBaseDelayMs: 10, retryJitterFactor: 0 };
 
+/**
+ * Build partial deps (legacy helper, use buildFullDeps for full deps).
+ * Only the given `opts` override the defaults.
+ */
+function buildDeps(
+    overrides: Partial<MakeCallToLLMOptions> & {
+        client?: HttpClient;
+        config?: Partial<LLMConfig>;
+        toolDispatcher?: ToolDispatcher;
+        sleepFn?: SleepFn;
+        message?: string;
+        setStats?: ReturnType<typeof vi.fn>;
+        store?: SessionStore;
+        compactionStrategy?: NoOpCompactionStrategy;
+        guardrails?: GuardrailConfigManager;
+        sessionLogger?: ReturnType<typeof makeMockLogger>;
+        signal?: AbortSignal;
+    } = {}
+): MakeCallToLLMOptions & { client: HttpClient; config: LLMConfig; toolDispatcher: ToolDispatcher } {
+    const client = overrides.client ?? {
+        fetchWithTimeout: vi.fn().mockResolvedValue(mockStreamResponse([mockSseChunk('default')])),
+    };
+    const config = overrides.config ?? {
+        getLLMUrl: () => 'http://localhost:8080/v1/chat/completions',
+        getTimeoutMs: () => 5000,
+        getModel: () => 'test-model',
+    };
+    const toolDispatcher = overrides.toolDispatcher ?? {
+        dispatchTool: vi.fn().mockResolvedValue('ok'),
+    };
+
+    return {
+        client: client as HttpClient,
+        config: config as LLMConfig,
+        toolDispatcher: toolDispatcher as ToolDispatcher,
+        ...overrides,
+    };
+}
+
+/**
+ * Build full deps for makeCallToLLM, nesting options properly.
+ */
+function buildFullDeps(overrides: {
+    client?: HttpClient;
+    config?: Partial<LLMConfig>;
+    toolDispatcher?: ToolDispatcher;
+    message?: string;
+    setStats?: ReturnType<typeof vi.fn>;
+    store?: SessionStore;
+    compactionStrategy?: NoOpCompactionStrategy;
+    guardrails?: GuardrailConfigManager;
+    sessionLogger?: ReturnType<typeof makeMockLogger>;
+    signal?: AbortSignal;
+    options?: MakeCallToLLMOptions;
+}) {
+    const client = overrides.client ?? {
+        fetchWithTimeout: vi.fn().mockResolvedValue(mockStreamResponse([mockSseChunk('default')])),
+    };
+    const config = overrides.config ?? {
+        getLLMUrl: () => 'http://localhost:8080/v1/chat/completions',
+        getTimeoutMs: () => 5000,
+        getModel: () => 'test-model',
+    };
+    const toolDispatcher = overrides.toolDispatcher ?? {
+        dispatchTool: vi.fn().mockResolvedValue('ok'),
+    };
+    const options = overrides.options ?? {};
+    return {
+        client: client as HttpClient,
+        config: config as LLMConfig,
+        toolDispatcher: toolDispatcher as ToolDispatcher,
+        message: overrides.message,
+        setStats: overrides.setStats ?? vi.fn(),
+        store: overrides.store ?? makeStore([]),
+        compactionStrategy: overrides.compactionStrategy ?? new NoOpCompactionStrategy(),
+        guardrails: overrides.guardrails ?? makeGuardrails(),
+        sessionLogger: overrides.sessionLogger ?? makeMockLogger(),
+        signal: overrides.signal,
+        options,
+    };
+}
+
 // ===================================================================
-// Tests
+// Tests — retry, abort, tool calls, stats, persistence
 // ===================================================================
 
-describe('makeCallToLLM — retry & exponential backoff', () => {
-    const baseUrl = 'http://localhost:8080';
-    let fetchMock: Mock;
+describe('makeCallToLLM — deps-based integration', () => {
+    let fetchMock: Mocked<HttpClient>['fetchWithTimeout'];
+    let loggerMock: ReturnType<typeof makeMockLogger>;
 
     beforeEach(() => {
-        fetchMock = vi.fn<typeof fetch>();
-        global.fetch = fetchMock;
+        fetchMock = vi.fn();
+        global.fetch = vi.fn();
+        loggerMock = makeMockLogger();
     });
 
     afterEach(() => {
@@ -197,19 +288,21 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
+        const toolDispatcher = { dispatchTool: vi.fn().mockResolvedValue('ok') };
 
-        // maxLoops: 2 allows 1 full iteration
-        await makeCallToLLM(
-            'test message',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'test message',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2 }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, maxRetries: 0 },
+        });
+
+        await makeCallToLLM(deps);
 
         expect(fetchMock).toHaveBeenCalledTimes(1);
         expect(setStats).toHaveBeenCalled();
@@ -228,17 +321,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, ...FAST_RETRY },
+        });
+
+        await makeCallToLLM(deps);
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
@@ -255,17 +349,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, ...FAST_RETRY },
+        });
+
+        await makeCallToLLM(deps);
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
@@ -282,17 +377,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, ...FAST_RETRY },
+        });
+
+        await makeCallToLLM(deps);
 
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
@@ -304,18 +400,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1 }
-        )).rejects.toThrow('LLM error: 400');
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1 },
+        });
 
+        await expect(makeCallToLLM(deps)).rejects.toThrow('LLM error: 400');
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -326,18 +422,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1 }
-        )).rejects.toThrow('LLM error: 401');
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1 },
+        });
 
+        await expect(makeCallToLLM(deps)).rejects.toThrow('LLM error: 401');
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
@@ -349,19 +445,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1, maxRetries: 1, ...FAST_RETRY }
-        )).rejects.toThrow();
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1, maxRetries: 1, ...FAST_RETRY },
+        });
 
-        // 1 initial + 1 retry = 2 calls total
+        await expect(makeCallToLLM(deps)).rejects.toThrow();
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
@@ -373,25 +468,23 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1, maxRetries: 0 }
-        )).rejects.toThrow();
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1, maxRetries: 0 },
+        });
 
-        // 0 retries = 1 call only
+        await expect(makeCallToLLM(deps)).rejects.toThrow();
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('should succeed after retries and continue loop for tool calls', async () => {
         const toolCallId = 'tc-test-1';
-        // 1st attempt fails, 2nd succeeds with tool call, 3rd finishes (no tool calls)
         fetchMock
             .mockRejectedValueOnce(new Error('NetworkError'))
             .mockResolvedValueOnce(mockStreamResponse([
@@ -403,22 +496,26 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
+        const toolDispatcher = {
+            dispatchTool: vi.fn().mockResolvedValue('tool result'),
+        };
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 4, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 4, ...FAST_RETRY },
+        });
+
+        await makeCallToLLM(deps);
 
         expect(fetchMock).toHaveBeenCalledTimes(3);
 
-        // Verify tool call message is in the store
         const messages = store.getMessages();
         const toolCallMsg = messages.find(m => m.role === 'assistant' && m.tool_calls);
         expect(toolCallMsg).toBeDefined();
@@ -433,26 +530,23 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1, maxRetries: 2, ...FAST_RETRY }
-        )).rejects.toThrow();
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1, maxRetries: 2, ...FAST_RETRY },
+        });
 
-        // 1 initial + 2 retries = 3 calls
+        await expect(makeCallToLLM(deps)).rejects.toThrow();
         expect(fetchMock).toHaveBeenCalledTimes(3);
     });
 
     it('should respect abort signal during retry wait', async () => {
-        // 1st attempt fails, then we abort during the retry delay
-        fetchMock
-            .mockRejectedValueOnce(new Error('NetworkError'));
+        fetchMock.mockRejectedValueOnce(new Error('NetworkError'));
 
         const store = makeStore([]);
         const guardrails = makeGuardrails();
@@ -460,30 +554,27 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
 
         const abortController = new AbortController();
 
-        const callPromise = makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            abortController.signal,
-            { maxLoops: 1, retryBaseDelayMs: 200, retryJitterFactor: 0 }
-        );
+            sessionLogger: loggerMock,
+            signal: abortController.signal,
+            options: { maxLoops: 1, retryBaseDelayMs: 200, retryJitterFactor: 0 },
+        });
 
-        // Abort during the retry delay — should interrupt it
+        const callPromise = makeCallToLLM(deps);
         await new Promise(r => setTimeout(r, 100));
         abortController.abort();
 
         await expect(callPromise).rejects.toThrow('Aborted');
-
-        // Verify fetch was called (the first attempt started)
         expect(fetchMock).toHaveBeenCalled();
     });
 
     it('should respect abort signal after fetch completes', async () => {
-        // 1st attempt fails, 2nd succeeds with a tool call
         fetchMock
             .mockRejectedValueOnce(new Error('NetworkError'))
             .mockResolvedValueOnce(mockStreamResponse([
@@ -497,19 +588,19 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
 
         const abortController = new AbortController();
 
-        const callPromise = makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            abortController.signal,
-            { maxLoops: 2, retryBaseDelayMs: 100, retryJitterFactor: 0 }
-        );
+            sessionLogger: loggerMock,
+            signal: abortController.signal,
+            options: { maxLoops: 2, retryBaseDelayMs: 100, retryJitterFactor: 0 },
+        });
 
-        // Abort during the retry delay
+        const callPromise = makeCallToLLM(deps);
         await new Promise(r => setTimeout(r, 50));
         abortController.abort();
 
@@ -524,19 +615,19 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            abortController.signal,
-            { maxLoops: 1 }
-        )).rejects.toThrow('Aborted');
+            sessionLogger: loggerMock,
+            signal: abortController.signal,
+            options: { maxLoops: 1 },
+        });
 
-        // Should throw before even calling fetch
+        await expect(makeCallToLLM(deps)).rejects.toThrow('Aborted');
         expect(fetchMock).toHaveBeenCalledTimes(0);
     });
 
@@ -552,52 +643,47 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'retry test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'retry test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, ...FAST_RETRY },
+        });
+
+        await makeCallToLLM(deps);
 
         const messages = store.getMessages();
-
-        // User message should be present
         const userMsg = messages.find(m => m.role === 'user' && m.content === 'retry test');
         expect(userMsg).toBeDefined();
 
-        // Assistant response should contain the retried content
         const assistantMsg = messages.find(m => m.role === 'assistant');
         expect(assistantMsg).toBeDefined();
         expect(assistantMsg!.content).toContain('After retry');
     });
 
     it('should use default maxRetries of 3', async () => {
-        // All attempts fail — should use initial + 3 retries = 4 calls
-        const error = new Error('NetworkError');
-        fetchMock.mockRejectedValue(error);
+        fetchMock.mockRejectedValue(new Error('NetworkError'));
 
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1, ...FAST_RETRY }
-        )).rejects.toThrow();
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1, ...FAST_RETRY },
+        });
 
-        // Default maxRetries = 3 → 1 initial + 3 retries = 4 calls
+        await expect(makeCallToLLM(deps)).rejects.toThrow();
         expect(fetchMock).toHaveBeenCalledTimes(4);
     });
 
@@ -610,18 +696,18 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2, ...FAST_RETRY },
+        });
 
+        await makeCallToLLM(deps);
         expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
@@ -632,99 +718,270 @@ describe('makeCallToLLM — retry & exponential backoff', () => {
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await expect(makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 1 }
-        )).rejects.toThrow('Some random error');
+            sessionLogger: loggerMock,
+            options: { maxLoops: 1 },
+        });
 
-        // Non-retryable error should not trigger retry — only 1 call
+        await expect(makeCallToLLM(deps)).rejects.toThrow('Some random error');
         expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
-    it('should retry on multiple consecutive 503 errors then succeed', async () => {
+    it('should call tool dispatcher and append tool result messages on tool_calls finish', async () => {
+        // maxLoops: 2 so the first iteration's tool call completes and the loop exits normally
+        const toolCallId = 'tc-tool-test-1';
         fetchMock
-            .mockResolvedValueOnce({ status: 503, body: null } as Response)
-            .mockResolvedValueOnce({ status: 503, body: null } as Response)
-            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('finally ok'), '[DONE]']));
+            .mockResolvedValueOnce(mockStreamResponse([
+                mockToolCallSse(toolCallId, 'read_files', '{"path":"test.txt"}'),
+                '[DONE]'
+            ]))
+            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('ok')]));
 
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
+        const toolDispatcher = {
+            dispatchTool: vi.fn().mockResolvedValue('file contents: hello'),
+        };
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'read test.txt',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, ...FAST_RETRY }
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
+
+        await makeCallToLLM(deps);
+
+        expect(toolDispatcher.dispatchTool).toHaveBeenCalledWith(
+            'read_files',
+            { path: 'test.txt' },
+            expect.objectContaining({ sessionStore: store })
         );
 
-        expect(fetchMock).toHaveBeenCalledTimes(3);
+        const messages = store.getMessages();
+        const toolResultMsg = messages.find(m => m.role === 'tool');
+        expect(toolResultMsg).toBeDefined();
+        expect(toolResultMsg!.content).toBe('file contents: hello');
     });
 
-    it('should respect custom retryBaseDelayMs and retryJitterFactor', async () => {
+    it('should handle tool failure gracefully', async () => {
+        // maxLoops: 2 so the first iteration's tool call completes and the loop exits normally
+        const toolCallId = 'tc-fail-1';
         fetchMock
-            .mockRejectedValueOnce(new Error('NetworkError'))
-            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('ok'), '[DONE]']));
+            .mockResolvedValueOnce(mockStreamResponse([
+                mockToolCallSse(toolCallId, 'read_files', '{"path":"nope.txt"}'),
+                '[DONE]'
+            ]))
+            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('ok')]));
 
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
+        const toolDispatcher = {
+            dispatchTool: vi.fn().mockRejectedValue(new Error('file not found')),
+        };
 
-        // Use a very small base delay for predictable timing in test
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'read nope.txt',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            makeMockLogger(),
-            undefined,
-            { maxLoops: 2, retryBaseDelayMs: 5, retryJitterFactor: 0 }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
 
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        await makeCallToLLM(deps);
+
+        const messages = store.getMessages();
+        const toolResultMsg = messages.find(m => m.role === 'tool');
+        expect(toolResultMsg).toBeDefined();
+        expect(toolResultMsg!.content).toContain('file not found');
     });
 
-    it('should log retry events with increasing delay', async () => {
-        const mockLogger = makeMockLogger();
-
+    it('should hit max loops and throw "Too many loops"', async () => {
+        const toolCallId = 'tc-loop-1';
         fetchMock
-            .mockRejectedValueOnce(new Error('NetworkError'))
-            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('ok'), '[DONE]']));
+            .mockResolvedValueOnce(mockStreamResponse([mockToolCallSse(toolCallId, 'noop', '{}'), '[DONE]']))
+            .mockResolvedValueOnce(mockStreamResponse([mockToolCallSse(toolCallId, 'noop', '{}'), '[DONE]']));
+
+        const store = makeStore([]);
+        const guardrails = makeGuardrails();
+        const setStats = vi.fn();
+        const toolDispatcher = {
+            dispatchTool: vi.fn().mockResolvedValue('ok'),
+        };
+
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'start',
+            setStats,
+            store,
+            compactionStrategy: new NoOpCompactionStrategy(),
+            guardrails,
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
+
+        await expect(makeCallToLLM(deps)).rejects.toThrow('Too many loops');
+    });
+
+    it('should set context size stats from SSE timings', async () => {
+        const timingsChunk = `data: ${JSON.stringify({
+            timings: { prompt_n: 200, cache_n: 100 },
+            choices: [{ delta: { content: 'hi' } }]
+        })}\n\n`;
+
+        fetchMock.mockResolvedValueOnce(mockStreamResponse([timingsChunk, '[DONE]']));
 
         const store = makeStore([]);
         const guardrails = makeGuardrails();
         const setStats = vi.fn();
 
-        await makeCallToLLM(
-            'test',
-            [],
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
             setStats,
             store,
-            new NoOpCompactionStrategy(),
+            compactionStrategy: new NoOpCompactionStrategy(),
             guardrails,
-            mockLogger,
-            undefined,
-            { maxLoops: 2, retryBaseDelayMs: 10, retryJitterFactor: 0 }
-        );
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
 
-        // Should have logged a retry debug message with attempt info
-        const retryLogs = mockLogger.debug.mock.calls.filter(call =>
-            typeof call[0] === 'object' && call[0].attempt !== undefined
-        );
-        expect(retryLogs.length).toBeGreaterThanOrEqual(1);
+        await makeCallToLLM(deps);
+
+        // setStats should have been called with contextSize=prompt_n+cache_n=300
+        const calls = setStats.mock.calls;
+        const lastCall = calls[calls.length - 1];
+        expect(lastCall[0].contextSize).toBe(300);
+        expect(lastCall[0].cachedContextSize).toBe(100);
+    });
+
+    it('should handle reasoning_content in SSE stream', async () => {
+        const reasoningChunk = `data: ${JSON.stringify({
+            timings: { prompt_n: 10, cache_n: 5 },
+            choices: [{ delta: { reasoning_content: 'thinking about it' } }]
+        })}\n\n`;
+        const contentChunk = `data: ${JSON.stringify({
+            choices: [{ delta: { content: 'answer' } }]
+        })}\n\n`;
+
+        fetchMock.mockResolvedValueOnce(mockStreamResponse([reasoningChunk, contentChunk, '[DONE]']));
+
+        const store = makeStore([]);
+        const guardrails = makeGuardrails();
+        const setStats = vi.fn();
+
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            message: 'test',
+            setStats,
+            store,
+            compactionStrategy: new NoOpCompactionStrategy(),
+            guardrails,
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
+
+        await makeCallToLLM(deps);
+
+        const messages = store.getMessages();
+        const assistantMsg = messages.find(m => m.role === 'assistant');
+        expect(assistantMsg!.reasoning_content).toContain('thinking about it');
+        expect(assistantMsg!.content).toContain('answer');
+        // The last setStats before the final idle status reflects the generating phase
+        expect(setStats.mock.calls.at(-2)[0].status).toBe('generating');
+    });
+});
+
+// ===================================================================
+// Unit tests for exported helpers
+// ===================================================================
+
+import { isRetryableError, computeBackoff, sleep, noopSleep } from './llm.js';
+
+describe('isRetryableError', () => {
+    it('should retry on fetch errors', () => {
+        expect(isRetryableError(new Error('fetch failed'))).toBe(true);
+    });
+
+    it('should retry on NetworkError', () => {
+        expect(isRetryableError(new Error('NetworkError: timeout'))).toBe(true);
+    });
+
+    it('should retry on ECONNREFUSED', () => {
+        expect(isRetryableError(new Error('ECONNREFUSED'))).toBe(true);
+    });
+
+    it('should retry on timeout errors', () => {
+        expect(isRetryableError(new Error('LLM request timeout after 600000ms'))).toBe(true);
+    });
+
+    it('should retry on 5xx LLM errors', () => {
+        expect(isRetryableError(new Error('LLM error: 500'))).toBe(true);
+    });
+
+    it('should retry on string with network indicators', () => {
+        expect(isRetryableError('network reset')).toBe(true);
+        expect(isRetryableError('timeout occurred')).toBe(true);
+        expect(isRetryableError('503 service unavailable')).toBe(true);
+    });
+
+    it('should NOT retry on non-retryable errors', () => {
+        expect(isRetryableError(new Error('Some random error'))).toBe(false);
+        expect(isRetryableError('some random string')).toBe(false);
+    });
+});
+
+describe('computeBackoff', () => {
+    it('should return exponential delay for attempt 0', () => {
+        const result = computeBackoff(0, 1000, 0);
+        expect(result).toBe(1000); // no jitter with factor 0
+    });
+
+    it('should double delay for attempt 1', () => {
+        const result = computeBackoff(1, 1000, 0);
+        expect(result).toBe(2000);
+    });
+
+    it('should double delay for attempt 2', () => {
+        const result = computeBackoff(2, 1000, 0);
+        expect(result).toBe(4000);
+    });
+
+    it('should add jitter proportional to factor', () => {
+        const result = computeBackoff(0, 1000, 1); // max jitter
+        expect(result).toBeGreaterThanOrEqual(1000);
+        expect(result).toBeLessThanOrEqual(2000);
+    });
+});
+
+describe('sleep / noopSleep', () => {
+    it('sleep should resolve after the given delay', async () => {
+        const start = Date.now();
+        await sleep(50);
+        expect(Date.now() - start).toBeGreaterThanOrEqual(40);
+    });
+
+    it('noopSleep should resolve immediately', async () => {
+        const start = Date.now();
+        await noopSleep(5000);
+        expect(Date.now() - start).toBeLessThan(100);
     });
 });

@@ -7,25 +7,22 @@ import { buildLLMPayload } from '../utils.js';
 import { AppConfig } from './config/index.js';
 import { parseSseStream } from './llm-sse-parser.js';
 
-
-const appConfig = AppConfig.getInstance();
-import { toolsByName, toolsToOpenAITools } from '../tools/index.js';
-import type { GuardrailConfigManager } from '../core/config/index.js';
 import pino from 'pino';
 import type { Logger } from 'pino';
+import type { GuardrailConfigManager } from './config/index.js';
 
 // ---------------------------------------------------------------------------
 // MCP client — lazily initialized, properly typed
 // ---------------------------------------------------------------------------
 
 interface McpClient {
-  connect(transport: McpTransport): Promise<void>;
-  callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<{ content: unknown[] }>;
+    connect(transport: McpTransport): Promise<void>;
+    callTool(params: { name: string; arguments: Record<string, unknown> }): Promise<{ content: unknown[] }>;
 }
 
 interface McpTransport {
-  connect(client: McpClient): Promise<void>;
-  disconnect(): Promise<void>;
+    connect(client: McpClient): Promise<void>;
+    disconnect(): Promise<void>;
 }
 
 let mcpClient: McpClient | null = null;
@@ -56,79 +53,6 @@ export async function connectToServer(url: string, logger?: Logger): Promise<boo
 }
 
 // ---------------------------------------------------------------------------
-// SSE stream parser — imported from llm-sse-parser.ts
-// ---------------------------------------------------------------------------
-
-// (parseSseStream, SseEvent, MAX_PARTIAL_JSON_BYTES, PARTIAL_JSON_TIMEOUT_MS)
-// are now exported from ./llm-sse-parser.ts
-
-// ---------------------------------------------------------------------------
-// HTTP request with timeout
-// ---------------------------------------------------------------------------
-
-interface LlmRequestOptions {
-    fetchUrl: string;
-    body: string;
-    signal?: AbortSignal;
-    timeoutMs: number;
-}
-
-async function fetchWithTimeout(opts: LlmRequestOptions): Promise<Response> {
-    const { fetchUrl, body, signal, timeoutMs } = opts;
-
-    // Fail fast if already aborted
-    if (signal?.aborted) {
-        throw new Error("LLM request aborted");
-    }
-
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    let aborted = false;
-    let fetchController: AbortController | null = null;
-
-    // Timeout that respects the abort signal
-    const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-            if (!aborted) {
-                fetchController?.abort();
-                reject(new Error(`LLM request timeout after ${timeoutMs}ms`));
-            }
-        }, timeoutMs);
-        // If already aborted during setup, clean up and reject
-        if (signal?.aborted) {
-            clearTimeout(timeoutHandle!);
-        }
-        signal?.addEventListener('abort', () => {
-            aborted = true;
-            clearTimeout(timeoutHandle!);
-        });
-    });
-
-    // If an external abort signal is provided, create our own controller
-    // so we can cancel the fetch independently when timeout wins the race.
-    if (signal) {
-        fetchController = new AbortController();
-        signal.addEventListener('abort', () => {
-            fetchController?.abort();
-        });
-    }
-
-    const fetchPromise = fetch(fetchUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-        signal: fetchController?.signal
-    });
-
-    const res = await Promise.race([fetchPromise, timeoutPromise]) as Response;
-
-    // Clean up timeout — race resolved, no longer needed
-    aborted = true;
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-
-    return res;
-}
-
-// ---------------------------------------------------------------------------
 // Tool dispatch
 // ---------------------------------------------------------------------------
 
@@ -137,6 +61,7 @@ export async function dispatchTool(
     args: Record<string, unknown>,
     ctx?: { guardrails?: GuardrailConfigManager; sessionStore?: SessionStore; abortSignal?: AbortSignal }
 ): Promise<string> {
+    const { toolsByName, toolsToOpenAITools } = await import('../tools/index.js');
     const tool = toolsByName[name];
     if (tool) {
         const result = await tool.execute(args as never, ctx);
@@ -192,27 +117,147 @@ function setToolCalls(lastMsg: Message, toolCalls: ToolCallAccumulator[]): Messa
     })) as Message['tool_calls'] };
 }
 
-function logStats(logger: pino.Logger, startTime: bigint, label: string, stats: Stats): void {
+function logStats(logger: Logger, startTime: bigint, label: string, stats: Stats): void {
     const ns = Number(process.hrtime.bigint() - startTime) / 1e9;
     const duration = ns.toFixed(3);
     logger.debug({ duration: `${duration}s`, tps: stats.tps, label }, `LLM round-trip: ${label}`);
 }
 
 // ---------------------------------------------------------------------------
-// Retry with exponential backoff
+// HttpClient — abstraction over fetch+timeout
 // ---------------------------------------------------------------------------
 
-/**
- * Sleep for a given number of milliseconds.
- */
-function sleep(ms: number): Promise<void> {
+export interface HttpClient {
+    fetchWithTimeout(opts: {
+        url: string;
+        body: string;
+        signal?: AbortSignal;
+        timeoutMs: number;
+    }): Promise<Response>;
+}
+
+/** Default implementation wrapping native fetch with a timeout. */
+export function createDefaultHttpClient(): HttpClient {
+    async function fetchWithTimeout(opts: {
+        url: string;
+        body: string;
+        signal?: AbortSignal;
+        timeoutMs: number;
+    }): Promise<Response> {
+        const { url, body, signal, timeoutMs } = opts;
+
+        if (signal?.aborted) {
+            throw new Error("LLM request aborted");
+        }
+
+        let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+        let aborted = false;
+        let fetchController: AbortController | null = null;
+
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => {
+                if (!aborted) {
+                    fetchController?.abort();
+                    reject(new Error(`LLM request timeout after ${timeoutMs}ms`));
+                }
+            }, timeoutMs);
+            if (signal?.aborted) {
+                clearTimeout(timeoutHandle!);
+            }
+            signal?.addEventListener('abort', () => {
+                aborted = true;
+                clearTimeout(timeoutHandle!);
+            });
+        });
+
+        if (signal) {
+            fetchController = new AbortController();
+            signal.addEventListener('abort', () => {
+                fetchController?.abort();
+            });
+        }
+
+        const fetchPromise = fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: fetchController?.signal
+        });
+
+        const res = await Promise.race([fetchPromise, timeoutPromise]) as Response;
+
+        aborted = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+
+        return res;
+    }
+    return { fetchWithTimeout };
+}
+
+// ---------------------------------------------------------------------------
+// LLMConfig — abstraction over AppConfig reads
+// ---------------------------------------------------------------------------
+
+export interface LLMConfig {
+    getLLMUrl(): string;
+    getTimeoutMs(): number;
+    getModel(): string;
+}
+
+/** Default implementation reading from AppConfig singleton. */
+export function createDefaultLLMConfig(): LLMConfig {
+    const config = AppConfig.getInstance();
+    return {
+            getLLMUrl: () => {
+            const raw = config.getString('LLAMACPP_URL') || 'http://localhost:8080/';
+            return new URL('/v1/chat/completions', raw).toString();
+        },
+        getTimeoutMs: () => config.getInt('LLM_TIMEOUT_MS') || 600_000,
+        getModel: () => config.getString('MODEL') ?? ''
+    };
+}
+
+// ---------------------------------------------------------------------------
+// ToolDispatcher — abstraction over tool execution
+// ---------------------------------------------------------------------------
+
+export interface ToolDispatcher {
+    dispatchTool(
+        name: string,
+        args: Record<string, unknown>,
+        ctx?: { guardrails?: GuardrailConfigManager; sessionStore?: SessionStore; abortSignal?: AbortSignal }
+    ): Promise<string>;
+}
+
+/** Default implementation using built-in dispatch. */
+export function createDefaultToolDispatcher(): ToolDispatcher {
+    return { dispatchTool };
+}
+
+// ---------------------------------------------------------------------------
+// SleepFn — injectable sleep for test determinism
+// ---------------------------------------------------------------------------
+
+export type SleepFn = (ms: number) => Promise<void>;
+
+/** Real sleep using setTimeout. */
+export function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+/** Deterministic sleep that resolves immediately. */
+export function noopSleep(_ms: number): Promise<void> {
+    return Promise.resolve();
+}
+
+// ---------------------------------------------------------------------------
+// Retry helpers — exported for independent testing
+// ---------------------------------------------------------------------------
 
 /**
  * Determine whether an error is retryable (transient network / server errors).
  */
-function isRetryableError(err: unknown): boolean {
+export function isRetryableError(err: unknown): boolean {
     if (err instanceof Error) {
         // Network-level failures
         if (err.message.includes('fetch') || err.message.includes('NetworkError') || err.message.includes('ECONNREFUSED')) {
@@ -236,12 +281,67 @@ function isRetryableError(err: unknown): boolean {
 
 /**
  * Calculate the backoff delay for a given retry attempt (0-indexed).
- * Uses exponential backoff with random jitter to prevent thundering herd.
  */
-function computeBackoff(attempt: number, baseDelayMs: number, jitterFactor: number): number {
+export function computeBackoff(attempt: number, baseDelayMs: number, jitterFactor: number): number {
     const exponentialDelay = baseDelayMs * Math.pow(2, attempt);
     const jitter = Math.random() * jitterFactor * baseDelayMs * Math.pow(2, attempt);
     return exponentialDelay + jitter;
+}
+
+// ---------------------------------------------------------------------------
+// SseEventParser — abstraction over SSE parsing
+// ---------------------------------------------------------------------------
+
+export interface SseEventParser {
+    parseSseStream(body: ReadableStream<Uint8Array>, logger: Logger): AsyncIterable<any>;
+}
+
+/** Default implementation wrapping parseSseStream. */
+function createDefaultSseEventParser(): SseEventParser {
+    return { parseSseStream: (body, logger) => parseSseStream(body, logger) };
+}
+
+// ---------------------------------------------------------------------------
+// Options types
+// ---------------------------------------------------------------------------
+
+export interface MakeCallToLLMOptions {
+    /** Maximum number of LLM round-trips in the auto-loop (default: 100). */
+    maxLoops?: number;
+    /** Maximum number of retries per LLM round-trip before failing (default: 3). */
+    maxRetries?: number;
+    /** Base delay in ms for exponential backoff (default: 1000). */
+    retryBaseDelayMs?: number;
+    /** Maximum jitter factor to spread retry times (0-1, default: 0.25). */
+    retryJitterFactor?: number;
+    /** Full system-prompt override replacing the default (e.g. JOB MODE). */
+    systemPrompt?: string;
+}
+
+/** All dependencies for a single makeCallToLLM invocation. */
+export interface MakeCallToLLMDeps {
+    /** HTTP client for fetching LLM responses. */
+    client: HttpClient;
+    /** Configuration source (url, timeout, model). */
+    config: LLMConfig;
+    /** User message to send (undefined = continue tool-call loop). */
+    message: string | undefined;
+    /** OpenAI-format tools array. */
+    tools: any[];
+    /** Callback to update stats in the UI. Accepts Stats or a reducer fn. */
+    setStats: React.Dispatch<React.SetStateAction<Stats>>;
+    /** Session store for messages and persistence. */
+    store: SessionStore;
+    /** Strategy for context compaction. */
+    compactionStrategy: CompactionStrategy;
+    /** Tool dispatcher for executing tool calls. */
+    toolDispatcher: ToolDispatcher;
+    /** Logger for the session. */
+    sessionLogger: Logger;
+    /** Optional abort signal. */
+    signal?: AbortSignal;
+    /** Retry and loop options. */
+    options?: MakeCallToLLMOptions;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,22 +362,22 @@ interface StreamOneTurnResult {
 
 async function streamOneTurn(
     body: string,
-    fetchUrl: string,
+    client: HttpClient,
+    url: string,
     timeoutMs: number,
     signal: AbortSignal | undefined,
     startTime: bigint,
     setStats: React.Dispatch<React.SetStateAction<Stats>>,
     store: SessionStore,
-    logger: pino.Logger,
+    logger: Logger,
     retryOpts: RetryOpts,
- ): Promise<StreamOneTurnResult> {
+    sleepFn: SleepFn,
+): Promise<StreamOneTurnResult> {
     const { maxRetries, baseDelayMs, jitterFactor } = retryOpts;
     const tokenCount = { value: 0 };
     const toolCalls: ToolCallAccumulator[] = [];
     let finishReason: string | undefined;
 
-    // Read the previous context size from the store so the gauge doesn't
-    // flash zero between turns or across makeCallToLLM invocations.
     const prevContextSize = store.getSnapshot().stats?.contextSize ?? 0;
     const prevCachedContextSize = store.getSnapshot().stats?.cachedContextSize ?? 0;
 
@@ -290,16 +390,16 @@ async function streamOneTurn(
 
         let res: Response;
         try {
-            res = await fetchWithTimeout({ fetchUrl, body, signal, timeoutMs });
+            res = await client.fetchWithTimeout({ url, body, signal, timeoutMs });
         } catch (e) {
             if (signal?.aborted) throw new Error("Aborted");
             const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
             const isR = isRetryableError(e);
-            logger[isR ? 'warn' : 'error']({ attempt, durationMs, url: fetchUrl }, isR ? `LLM call failed (retryable): ${String(e)}` : `LLM call failed: ${String(e)}`);
+            logger[isR ? 'warn' : 'error']({ attempt, durationMs, url }, isR ? `LLM call failed (retryable): ${String(e)}` : `LLM call failed: ${String(e)}`);
             if (!isR || attempt >= maxRetries) throw e;
             const fetchDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
             logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: fetchDelayMs }, `Retrying LLM call in ${Math.round(fetchDelayMs)}ms`);
-            await sleep(fetchDelayMs);
+            await sleepFn(fetchDelayMs);
             continue;
         }
 
@@ -309,11 +409,11 @@ async function streamOneTurn(
             const durationMs = Number(process.hrtime.bigint() - startTime) / 1e6;
             const retryable = /^5\d\d$/.test(String(res.status));
             try { await res.text(); } catch { /* ignore */ }
-            logger[retryable ? 'warn' : 'error']({ status: res.status, url: fetchUrl, durationMs, retryable }, `LLM API error`);
+            logger[retryable ? 'warn' : 'error']({ status: res.status, url, durationMs, retryable }, `LLM API error`);
             if (!retryable || attempt >= maxRetries) throw new Error(`LLM error: ${res.status}`);
             const httpDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
             logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: httpDelayMs, status: res.status }, `Retrying LLM call in ${Math.round(httpDelayMs)}ms`);
-            await sleep(httpDelayMs);
+            await sleepFn(httpDelayMs);
             continue;
         }
 
@@ -382,11 +482,11 @@ async function streamOneTurn(
             if (!isR || attempt >= maxRetries) throw e;
             const streamDelayMs = computeBackoff(attempt, baseDelayMs, jitterFactor);
             logger.debug({ attempt, nextAttempt: attempt + 1, delayMs: streamDelayMs }, `Retrying stream in ${Math.round(streamDelayMs)}ms`);
-            await sleep(streamDelayMs);
+            await sleepFn(streamDelayMs);
             continue;
         }
 
-        break; // stream completed successfully
+        break;
     }
 
     return { toolCalls, finishReason, stats };
@@ -399,9 +499,9 @@ async function streamOneTurn(
 async function executeToolCalls(
     toolCalls: ToolCallAccumulator[],
     store: SessionStore,
-    guardrails: GuardrailConfigManager,
+    toolDispatcher: ToolDispatcher,
     signal: AbortSignal | undefined,
-    logger: pino.Logger,
+    logger: Logger,
     startTime: bigint
 ): Promise<void> {
     store.updateMessages(msgs => updateLastAssistantMessage(msgs, last => setToolCalls(last, toolCalls)));
@@ -409,7 +509,7 @@ async function executeToolCalls(
     for (const tc of toolCalls) {
         try {
             const args = JSON.parse(tc.function.arguments || '{}');
-            const result = await dispatchTool(tc.function.name || '', args, { guardrails, sessionStore: store, abortSignal: signal });
+            const result = await toolDispatcher.dispatchTool(tc.function.name || '', args, { sessionStore: store, abortSignal: signal });
             logger.debug({ tool: tc.function.name, tool_call_id: tc.id }, `Tool executed in ${Number(process.hrtime.bigint() - startTime) / 1e6}ms`);
             store.updateMessages(msgs => [...msgs, createMessage({ role: 'tool', tool_call_id: tc.id, content: String(result) })]);
         } catch (err) {
@@ -420,36 +520,50 @@ async function executeToolCalls(
 }
 
 // ---------------------------------------------------------------------------
+// persistAndCompact — side-effects after each loop iteration
+// ---------------------------------------------------------------------------
+
+async function persistAndCompact(
+    store: SessionStore,
+    compactionStrategy: CompactionStrategy,
+    logger: Logger
+): Promise<void> {
+    try {
+        await store.persist();
+    } catch (persistErr) {
+        logger.error({ error: String(persistErr) }, 'Failed to persist session (non-fatal)');
+    }
+
+    if (compactionStrategy.shouldTrigger(store)) {
+        try {
+            await compactionStrategy.doCompaction(store);
+            await store.persist();
+        } catch (compactErr) {
+            logger.error({ error: String(compactErr) }, 'Compaction failed (non-fatal)');
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export interface MakeCallToLLMOptions {
-    /** Maximum number of LLM round-trips in the auto-loop (default: 100). */
-    maxLoops?: number;
-    /** Maximum number of retries per LLM round-trip before failing (default: 3). */
-    maxRetries?: number;
-    /** Base delay in ms for exponential backoff (default: 1000). */
-    retryBaseDelayMs?: number;
-    /** Maximum jitter factor to spread retry times (0-1, default: 0.25). */
-    retryJitterFactor?: number;
-    /** Full system-prompt override replacing the default (e.g. JOB MODE). */
-    systemPrompt?: string;
-}
+/**
+ * Make a call to the LLM, handling the tool-call loop, retries, and
+ * post-turn side effects (persistence, compaction).
+ *
+ * All external dependencies are injected via `deps` for testability.
+ */
+export async function makeCallToLLM(deps: MakeCallToLLMDeps): Promise<void> {
+    const {
+        client, config, message, tools, setStats, store,
+        compactionStrategy, toolDispatcher, sessionLogger,
+        signal, options
+    } = deps;
 
-export async function makeCallToLLM(
-    message: string | undefined,
-    tools: any[],
-    setStats: React.Dispatch<React.SetStateAction<Stats>>,
-    store: SessionStore,
-    compactionStrategy: CompactionStrategy,
-    guardrails: GuardrailConfigManager,
-    sessionLogger: pino.Logger,
-    signal?: AbortSignal,
-    options?: MakeCallToLLMOptions
-) {
     const maxLoops = options?.maxLoops ?? 100;
-    const fetchUrl = String(new URL('/v1/chat/completions', appConfig.getString('LLAMACPP_URL', 'http://localhost:8080/')));
-    const timeoutMs = appConfig.getInt('LLM_TIMEOUT_MS') || 600_000;
+    const fetchUrl = config.getLLMUrl();
+    const timeoutMs = config.getTimeoutMs();
     const retryOpts: RetryOpts = {
         maxRetries: options?.maxRetries ?? 3,
         baseDelayMs: options?.retryBaseDelayMs ?? 1000,
@@ -457,6 +571,7 @@ export async function makeCallToLLM(
     };
 
     let loopCount = 0;
+    let lastDidToolCall = false;
 
     while (loopCount < maxLoops) {
         loopCount++;
@@ -464,13 +579,23 @@ export async function makeCallToLLM(
         if (message) {
             store.updateMessages(msgs => [...msgs, createMessage({ role: 'user', content: message })]);
         }
-        message = undefined;
+        // message is consumed on first iteration; subsequent loop iterations
+        // are driven by tool-call results.
+        const consumedMessage = message;
+
+        const openAITools = (tools ?? []).map(t => ({
+            type: 'function' as const,
+            function: {
+                name: t.name,
+                description: t.description,
+                parameters: t.schema
+            }
+        }));
+        const body = JSON.stringify(buildLLMPayload(store.getMessages(), openAITools, options?.systemPrompt));
 
         const startTime = process.hrtime.bigint();
-        const body = JSON.stringify(buildLLMPayload(store.getMessages(), toolsToOpenAITools(tools), options?.systemPrompt));
-
         const { toolCalls, finishReason, stats } = await streamOneTurn(
-            body, fetchUrl, timeoutMs, signal, startTime, setStats, store, sessionLogger, retryOpts
+            body, client, fetchUrl, timeoutMs, signal, startTime, setStats, store, sessionLogger, retryOpts, sleep
         );
 
         const didToolCall = finishReason === 'tool_calls' && toolCalls.length > 0;
@@ -478,34 +603,42 @@ export async function makeCallToLLM(
         if (didToolCall) {
             stats.status = 'tool_running';
             setStats({ ...stats });
-            await executeToolCalls(toolCalls, store, guardrails, signal, sessionLogger, startTime);
+            await executeToolCalls(toolCalls, store, toolDispatcher, signal, sessionLogger, startTime);
         }
 
-        try {
-            await store.persist();
-        } catch (persistErr) {
-            sessionLogger.error({ error: String(persistErr) }, 'Failed to persist session (non-fatal)');
-        }
-
-        if (compactionStrategy.shouldTrigger(store)) {
-            try {
-                await compactionStrategy.doCompaction(store);
-                await store.persist();
-            } catch (compactErr) {
-                sessionLogger.error({ error: String(compactErr) }, 'Compaction failed (non-fatal)');
-            }
-        }
+        await persistAndCompact(store, compactionStrategy, sessionLogger);
 
         logStats(sessionLogger, startTime, 'complete', stats);
         stats.tps = 0;
         stats.status = 'idle';
         setStats({ ...stats });
 
+        lastDidToolCall = didToolCall;
         if (!didToolCall) break;
     }
 
-    if (loopCount >= maxLoops) {
+    // "Too many loops" only if the loop exhausted its budget due to tool calls
+    // (i.e., the last iteration that ran was a tool call)
+    if (loopCount >= maxLoops && lastDidToolCall) {
         sessionLogger.warn({ loopCount }, "LLM auto-loop hit max iteration limit");
         throw new Error("Too many loops");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Convenience: create default deps from the existing globals
+// ---------------------------------------------------------------------------
+
+export function createDefaultDeps(
+    base: Omit<MakeCallToLLMDeps, 'client' | 'config' | 'toolDispatcher'>
+): MakeCallToLLMDeps {
+    return {
+        client: createDefaultHttpClient(),
+        config: createDefaultLLMConfig(),
+        toolDispatcher: createDefaultToolDispatcher(),
+        ...base,
+    };
+}
+
+// ---------------------------------------------------------------------------
+

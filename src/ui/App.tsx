@@ -29,7 +29,8 @@ import { SessionStore } from '../core/session.js';
 import type pino from 'pino';
 import { CompactionStrategy, RunningMemoryStrategy } from '../core/compaction.js';
 import { classifyJobOutcome, type JobConfig } from '../core/job.js';
-import type { MakeCallToLLMOptions } from '../core/llm.js';
+import type { MakeCallToLLMDeps } from '../core/llm.js';
+import { makeCallToLLM, createDefaultHttpClient, createDefaultLLMConfig, createDefaultToolDispatcher } from '../core/llm.js';
 import { tools as defaultTools } from '../tools/index.js';
 import type { GuardrailConfigManager } from '../core/config/index.js';
 import { AppConfig } from '../core/config/index.js';
@@ -235,17 +236,8 @@ function ReviewView({
 // --- Component ---
 
 interface AppProps {
-    makeCallToLLM: (
-        message: string | undefined,
-        tools: any[],
-        setStats: React.Dispatch<React.SetStateAction<Stats>>,
-        store: SessionStore,
-        compactionStrategy: CompactionStrategy,
-        guardrails: GuardrailConfigManager,
-        sessionLogger: pino.Logger,
-        signal?: AbortSignal,
-        options?: MakeCallToLLMOptions
-    ) => Promise<void>;
+    /** Core LLM caller — accepts a MakeCallToLLMDeps object. */
+    makeCallToLLM: (deps: MakeCallToLLMDeps) => Promise<void>;
     store: SessionStore;
     sessionLogger: pino.Logger;
     guardrails: GuardrailConfigManager;
@@ -521,7 +513,18 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails, job, onJo
 
         try {
             const currentTools = tools.length > 0 ? [...tools] : [];
-            await makeCallToLLM(value, currentTools, setStats, store, compactionStrategy, guardrails, sessionLogger, abortControllerRef.current.signal);
+            await makeCallToLLM({
+                client: createDefaultHttpClient(),
+                config: createDefaultLLMConfig(),
+                toolDispatcher: createDefaultToolDispatcher(),
+                message: value,
+                tools: currentTools,
+                setStats,
+                store,
+                compactionStrategy,
+                sessionLogger,
+                signal: abortControllerRef.current.signal,
+            });
         } catch (e) {
             if (e instanceof Error && e.message === 'Aborted') {
                 setNotification("Turn abandoned.");
@@ -550,17 +553,19 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails, job, onJo
 
             let code = 1;
             try {
-                await makeCallToLLM(
-                    job.prompt,
-                    tools.length > 0 ? [...tools] : [],
+                await makeCallToLLM({
+                    client: createDefaultHttpClient(),
+                    config: createDefaultLLMConfig(),
+                    toolDispatcher: createDefaultToolDispatcher(),
+                    message: job.prompt,
+                    tools: tools.length > 0 ? [...tools] : [],
                     setStats,
                     store,
                     compactionStrategy,
-                    guardrails,
                     sessionLogger,
-                    abortControllerRef.current.signal,
-                    { maxLoops: activeJob.maxLoops, systemPrompt: activeJob.systemPrompt }
-                );
+                    signal: abortControllerRef.current.signal,
+                    options: { maxLoops: activeJob.maxLoops, systemPrompt: activeJob.systemPrompt },
+                });
 
                 // Classify the outcome from the final assistant message's sentinel.
                 const msgs = store.getMessages();
