@@ -572,16 +572,18 @@ export async function makeCallToLLM(deps: MakeCallToLLMDeps): Promise<void> {
 
     let loopCount = 0;
     let lastDidToolCall = false;
+    // Consumed on the first iteration only; subsequent iterations are driven by
+    // tool-call results, so we clear it to avoid re-appending the same user
+    // message on every loop.
+    let pendingMessage = message;
 
     while (loopCount < maxLoops) {
         loopCount++;
 
-        if (message) {
-            store.updateMessages(msgs => [...msgs, createMessage({ role: 'user', content: message })]);
+        if (pendingMessage) {
+            store.updateMessages(msgs => [...msgs, createMessage({ role: 'user', content: pendingMessage })]);
+            pendingMessage = undefined;
         }
-        // message is consumed on first iteration; subsequent loop iterations
-        // are driven by tool-call results.
-        const consumedMessage = message;
 
         const openAITools = (tools ?? []).map(t => ({
             type: 'function' as const,

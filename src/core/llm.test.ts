@@ -776,6 +776,44 @@ describe('makeCallToLLM — deps-based integration', () => {
         expect(toolResultMsg!.content).toBe('file contents: hello');
     });
 
+    it('should append the initial user message only once across tool-call loops', async () => {
+        // Regression: the loop used to re-append `message` on every iteration
+        // because it was never consumed, so after a tool call the original user
+        // message reappeared as a fresh user message on the next turn.
+        const toolCallId = 'tc-once-1';
+        fetchMock
+            .mockResolvedValueOnce(mockStreamResponse([
+                mockToolCallSse(toolCallId, 'read_files', '{"path":"test.txt"}'),
+                '[DONE]'
+            ]))
+            .mockResolvedValueOnce(mockStreamResponse([mockSseChunk('done')]));
+
+        const store = makeStore([]);
+        const guardrails = makeGuardrails();
+        const toolDispatcher = {
+            dispatchTool: vi.fn().mockResolvedValue('file contents: hello'),
+        };
+
+        const deps = buildFullDeps({
+            client: { fetchWithTimeout: fetchMock },
+            toolDispatcher,
+            message: 'read test.txt',
+            setStats: vi.fn(),
+            store,
+            compactionStrategy: new NoOpCompactionStrategy(),
+            guardrails,
+            sessionLogger: loggerMock,
+            options: { maxLoops: 2 },
+        });
+
+        await makeCallToLLM(deps);
+
+        const userMsgs = store.getMessages().filter(
+            m => m.role === 'user' && m.content === 'read test.txt'
+        );
+        expect(userMsgs).toHaveLength(1);
+    });
+
     it('should handle tool failure gracefully', async () => {
         // maxLoops: 2 so the first iteration's tool call completes and the loop exits normally
         const toolCallId = 'tc-fail-1';
@@ -914,7 +952,7 @@ describe('makeCallToLLM — deps-based integration', () => {
 // Unit tests for exported helpers
 // ===================================================================
 
-import { isRetryableError, computeBackoff, sleep, noopSleep } from './llm.js';
+import { isRetryableError, computeBackoff, sleep } from './llm.js';
 
 describe('isRetryableError', () => {
     it('should retry on fetch errors', () => {
