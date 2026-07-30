@@ -122,7 +122,16 @@ export class RunningMemoryStrategy implements CompactionStrategy {
                     role: 'assistant',
                     content: msg.content ?? '',
                 };
-                if (cleanMsg.content) {
+                // Preserve tool_calls: dropping them would orphan the tool
+                // result messages that follow (they reference tool_call_id),
+                // producing an invalid conversation that stalls the tool loop.
+                if (msg.tool_calls && msg.tool_calls.length > 0) {
+                    cleanMsg.tool_calls = msg.tool_calls;
+                }
+                // Keep the message if it has content OR carries tool_calls.
+                // A pure tool-call turn has empty content but must survive so
+                // its tool results stay paired.
+                if (cleanMsg.content || cleanMsg.tool_calls) {
                     compressed.push(cleanMsg);
                 }
             } else if (msg.role === 'tool') {

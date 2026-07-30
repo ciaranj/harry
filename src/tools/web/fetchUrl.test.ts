@@ -1,6 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { fetchUrl, loadManifest, saveManifest } from './fetchUrl.js';
 import { createSession, SessionStore } from '../../core/session.js';
+
+// Several tests spy on global.fetch. Without restoring between tests the spies
+// stack on global.fetch, so a later test's fresh spy sees inflated call counts
+// (e.g. the TTL test counting 2 fetches for a single request).
+afterEach(() => {
+    vi.restoreAllMocks();
+});
 
 function createTestCtx(sessionId?: string) {
   const session = createSession(process.cwd());

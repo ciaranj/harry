@@ -190,6 +190,49 @@ describe('RunningMemoryStrategy', () => {
         expect(refMsg?.content).toContain('retrieve_tool_output');
     });
 
+    it('doCompaction preserves assistant tool_calls so tool results stay paired', async () => {
+        // Regression: compaction used to strip tool_calls off older assistant
+        // messages and drop pure tool-call turns (empty content) entirely,
+        // orphaning the following tool result messages. The corrupted history
+        // then stalled the tool loop on the next iteration.
+        const strategy = new RunningMemoryStrategy({ recentTurns: 1, maxContextSize: 102400 });
+
+        const assistantWithCall = (id: string, content: string): Message => {
+            const m = createMessage({ role: 'assistant', content });
+            m.tool_calls = [{ id, type: 'function', function: { name: 'do_thing', arguments: '{}' } }];
+            return m;
+        };
+
+        const messages: Message[] = [
+            makeMsg('user', 'q1'),
+            assistantWithCall('tc-1', ''),                       // pure tool call, empty content
+            makeMsg('tool', 'result 1', undefined, 'tc-1'),
+            assistantWithCall('tc-2', 'let me fix that'),        // content + tool call
+            makeMsg('tool', 'result 2', undefined, 'tc-2'),
+            makeMsg('user', 'q2'),
+            makeMsg('assistant', 'final answer'),                // recent, kept uncompressed
+        ];
+
+        const store = makeStoreWithMessages(messages);
+        await strategy.doCompaction(store);
+        const result = store.getMessages().filter(m => m.role !== 'event');
+
+        // Every tool result must be preceded by an assistant carrying a
+        // matching tool_call id — no orphans.
+        const advertisedCallIds = new Set(
+            result.flatMap(m => m.tool_calls?.map(tc => tc.id) ?? []),
+        );
+        for (const m of result) {
+            if (m.role === 'tool') {
+                expect(advertisedCallIds.has(m.tool_call_id!)).toBe(true);
+            }
+        }
+
+        // The empty-content pure tool-call turn must survive with its tool_calls.
+        expect(advertisedCallIds.has('tc-1')).toBe(true);
+        expect(advertisedCallIds.has('tc-2')).toBe(true);
+    });
+
     it('doCompaction returns early when not enough messages', async () => {
         const strategy = new RunningMemoryStrategy({ recentTurns: 6, maxContextSize: 102400 });
         const messages = [makeMsg('user', 'hi'), makeMsg('assistant', 'hello')];
