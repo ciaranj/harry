@@ -325,12 +325,43 @@ export const App = ({ makeCallToLLM, store, sessionLogger, guardrails, job, onJo
         setIsReviewing(false);
     }, [stdout]);
 
-    // Subscribe to store changes
+    // Subscribe to store changes, throttled to ~30fps.
+    //
+    // Streaming LLM output calls the store once per token (per SSE delta),
+    // which without throttling would force a full Ink re-render + stdout
+    // write per token — O(messages) work each time. Slow terminal consumers
+    // (notably VS Code's integrated terminal, which drains ANSI output
+    // slower than native emulators) can't keep up, so Node's write queue
+    // backs up and grows unbounded over a long response. Coalescing bursts
+    // into one flush per window keeps render/write frequency capped
+    // regardless of token rate; the leading edge still fires synchronously
+    // so a single isolated update (e.g. a tool result) shows up immediately.
     useEffect(() => {
+        const THROTTLE_MS = 33;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        let pending = false;
+
+        const flush = () => setMessages(store.getMessages());
+
         const unsub = store.subscribe(() => {
-            setMessages(store.getMessages());
+            if (timer) {
+                pending = true;
+                return;
+            }
+            flush();
+            timer = setTimeout(() => {
+                timer = null;
+                if (pending) {
+                    pending = false;
+                    flush();
+                }
+            }, THROTTLE_MS);
         });
-        return unsub;
+
+        return () => {
+            if (timer) clearTimeout(timer);
+            unsub();
+        };
     }, [store]);
 
     // Commit completed messages to the static history when a turn ends.
